@@ -125,9 +125,9 @@ class GemmaEngine:
             str: Textual description of the scene incorporating both visual and auditory cues
         """
         multimodal = audio is not None
-        # Keep prompt very short - mission is handled elsewhere
+        # Efficient prompt that encourages detailed scene description and reasoning
         # DO NOT add <image> token manually - let the processor do it
-        prompt = "Describe what you see" + (" and hear" if multimodal else "") + " in a detailed sentence."
+        prompt = "Describe what you see" + (" and hear" if multimodal else "") + ". Include all important details and your observations about the scene."
                 
         if not self.model or not self.processor:
             logger.error("Model or processor not loaded. Cannot describe scene.")
@@ -270,13 +270,17 @@ class GemmaEngine:
                     # Stop the first progress thread
                     generation_complete.set()
                     
-                    # Now immediately do a second generation with better settings
+                    # Now immediately do a second generation with better settings and different prompt
                     # This will be much faster since model is compiled and loaded
-                    logger.info("🚀 Initial warmup complete - now generating full response...")
+                    logger.info("🚀 Initial warmup complete - now generating detailed scene analysis...")
                     
-                    # Reset progress monitoring for full generation
+                    # Modify the prompt slightly for the second generation to avoid EOS
+                    # But keep it concise to maintain token efficiency
+                    prompt_phase2 = prompt + " Continue with more observations:"
+                    
+                    # Reset progress monitoring for full generation and create new event to avoid thread conflicts
                     gen_start = time.time()
-                    generation_complete = threading.Event()
+                    generation_complete_phase2 = threading.Event()
                     
                     # Create a new progress thread for the full generation
                     def full_generation_progress():
@@ -288,18 +292,36 @@ class GemmaEngine:
                                 
                             elapsed = time.time() - gen_start
                             if elapsed >= 15 and elapsed % 15 < 5:  # Log more frequently for second run
-                                logger.info(f"⏳ Still generating response... {elapsed:.1f} seconds elapsed")
+                                logger.info(f"⏳ Still generating detailed scene analysis... {elapsed:.1f} seconds elapsed")
                     
-                    # Start the full generation progress thread
-                    progress_thread = threading.Thread(target=full_generation_progress, daemon=True)
-                    progress_thread.start()
+                    # Start the full generation progress thread with a new thread object
+                    progress_thread_phase2 = threading.Thread(target=full_generation_progress, daemon=True)
+                    progress_thread_phase2.start()
+                    
+                    # Use the existing streamer instead of creating a custom one
+                    # HuggingFace's TextStreamer already handles token streaming efficiently
+                    if not hasattr(streamer, "token_seen"):
+                        # Add a minimal wrapper to log tokens without creating a new class
+                        original_on_finalized_text = streamer.on_finalized_text
+                        
+                        def log_and_stream(text, stream_end=False):
+                            if text.strip():
+                                logger.info(f"🔄 TOKEN: {repr(text)}")
+                            return original_on_finalized_text(text, stream_end)
+                        
+                        streamer.on_finalized_text = log_and_stream
+                        streamer.token_seen = True
+                    
+                    # Use a more moderate token count for efficiency while still getting good descriptions
+                    # Reuse the same inputs but with different generation settings
                     generation = self.model.generate(
-                        **inputs,
-                        max_new_tokens=64,    # Full response
-                        do_sample=True,       # Enable sampling for better quality
-                        top_k=40,             # Reasonable sampling parameters
-                        top_p=0.9,
-                        streamer=streamer      # Stream tokens
+                        **inputs,  # Reuse the same inputs for efficiency
+                        max_new_tokens=128,  # Balanced token count for good descriptions without excess
+                        do_sample=True,      # Enable sampling for better quality
+                        temperature=0.7,     # Good balance for creativity vs coherence
+                        top_k=40,           
+                        top_p=0.9,          
+                        streamer=streamer    # Reuse the existing streamer with our logging wrapper
                     )
                 else:
                     # Normal mode - model is already warmed up
@@ -312,10 +334,15 @@ class GemmaEngine:
                         streamer=streamer      # Stream tokens
                     )
                 
-                # Signal that generation is complete to stop the progress thread
-                generation_complete.set()
-                # Ensure the first progress thread terminates before starting phase-2 logs
-                progress_thread.join(timeout=1)
+                # Signal that generation is complete to stop all progress threads
+                if 'generation_complete' in locals():
+                    generation_complete.set()
+                if 'generation_complete_phase2' in locals():
+                    generation_complete_phase2.set()
+                if 'progress_thread' in locals():
+                    progress_thread.join(timeout=1)
+                if 'progress_thread_phase2' in locals():
+                    progress_thread_phase2.join(timeout=1)
                 logger.info(f"✓ First generation completed in {time.time() - gen_start:.1f}s")
             except RuntimeError as e:
                 error_msg = str(e)
@@ -404,17 +431,26 @@ class GemmaEngine:
                 else:
                     # Re-raise for other errors
                     raise
-            # Log token count metrics
+            # Token metrics were logged earlier, avoid duplication
+
+            # Log token count metrics before decoding
             input_length = len(inputs['input_ids'][0])
             output_length = len(generation[0])
             new_tokens = output_length - input_length
             logger.info(f"Generation produced {new_tokens} new tokens (from {input_length} input tokens)")
-
+            
             # Decode final result from the full generation
             result = self.processor.decode(generation[0], skip_special_tokens=True)
             
-            # Extract description (remove prompt)
-            description = result[len(prompt):].strip()
+            # For phase 2, we need to extract content after the enhanced prompt
+            if 'prompt_phase2' in locals():
+                # Extract description (remove enhanced prompt)
+                # Try to find a reasonable position after the prompt
+                base_prompt_len = len(prompt)
+                description = result[base_prompt_len:].strip()
+            else:
+                # Regular generation - extract after original prompt
+                description = result[len(prompt):].strip()
             
             inference_time = time.time() - start_time
             logger.info(f"Scene description inference: {inference_time*1000:.1f}ms")
