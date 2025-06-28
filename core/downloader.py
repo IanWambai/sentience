@@ -187,11 +187,21 @@ class AssetManager:
         """
         Check if the system has enough memory to run the model.
         
+        On macOS, this includes 'inactive' memory for a more accurate assessment.
+
         Returns:
             bool: True if system has enough memory, False otherwise
         """
-        available_memory = psutil.virtual_memory().available / (1024.0 ** 3)  # Convert to GB
+        mem = psutil.virtual_memory()
+        if platform.system() == "Darwin":  # macOS
+            # On macOS, 'available' can be misleading. A better measure is available + inactive.
+            available_memory = (mem.available + mem.inactive) / (1024.0 ** 3)
+        else:
+            available_memory = mem.available / (1024.0 ** 3)  # Convert to GB
+            
         if available_memory < self.REQUIRED_MEMORY_GB:
             logger.error(f"Insufficient system memory: {available_memory:.2f} GB available, but {self.REQUIRED_MEMORY_GB} GB required")
             return False
+        
+        logger.info(f"System memory check passed: {available_memory:.2f} GB available.")
         return True
