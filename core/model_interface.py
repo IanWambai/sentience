@@ -143,13 +143,16 @@ class GemmaEngine:
             
             # Process inputs based on available modalities
             # Prepare inputs
-            # Use processor directly with the correct format
-            # No need to manually add image token - processor handles it
+            # Insert single placeholder image token that the processor will expand
+            image_placeholder = self.processor.image_token if hasattr(self.processor, "image_token") else "<image>"
+            prompt_with_token = f"{image_placeholder} {prompt}"
+            
             processor_inputs = {
-                "text": prompt,
+                "text": prompt_with_token,
                 "images": image,
                 "return_tensors": "pt"
             }
+            logger.debug("Prompt with placeholder token: %s", prompt_with_token)
             logger.debug("Using prompt with image token: %s", prompt[:50] + "...")
 
             # Add audio if available
@@ -170,6 +173,8 @@ class GemmaEngine:
                 
                 processor_inputs["audio"] = audio_cpu
                 processor_inputs["sampling_rate"] = audio_sampling_rate
+                # Update text field to include placeholder
+                processor_inputs["text"] = prompt_with_token
                 logger.debug(f"Processing with multimodal input (vision + audio), audio shape: {np.shape(audio_cpu)}")
 
             else:
