@@ -67,8 +67,26 @@ class GemmaEngine:
             )
             logger.info("✓ Model loaded into RAM. Moving to MPS device...")
             # Now, move the entire model to the MPS device
-            self.model.to(self.device)
-            logger.info("✓ Model successfully moved to device.")
+            # On Apple Silicon keep whole model on CPU for stability
+            if self.device == "mps":
+                logger.info("Keeping entire model on CPU to avoid mixed-device deadlock")
+                self.model.to("cpu")
+                self.device = "cpu"
+            else:
+                self.model.to(self.device)
+            # Move language layers to device, but keep vision tower on CPU to avoid Apple Silicon attention mismatch
+            logger.debug("Placing vision_tower on CPU and language layers on %s", self.device)
+            if hasattr(self.model, "vision_tower") and self.device == "mps":
+                self.model.vision_tower.to("cpu")
+                self.vision_cpu = True
+                logger.info("✓ Vision tower kept on CPU for compatibility.")
+            else:
+                self.vision_cpu = False
+            # Remove unsupported default generation params cleanly to silence warnings
+            for bad_key in ("top_p", "top_k"):
+                if getattr(self.model.generation_config, bad_key, None) is not None:
+                    setattr(self.model.generation_config, bad_key, None)
+            logger.info("✓ Model successfully moved to device (vision_cpu=%s).", self.vision_cpu)
         except Exception as e:
             logger.critical(f"❌ Failed to load model: {e}", exc_info=True)
             logger.critical("Model files may be corrupt, or system may lack necessary drivers (e.g., MPS).")
@@ -152,12 +170,27 @@ class GemmaEngine:
             else:
                 logger.debug("Processing with vision input only")
                 
-            # Create model inputs (all tensors should be on CPU at this point for the processor)
-            inputs = self.processor(**processor_inputs).to(self.device)
+            # Create model inputs on CPU first then move tensors to appropriate devices
+            inputs = self.processor(**processor_inputs)
+            # Since model is on CPU, keep all tensors on CPU to match
+            for name, tensor in inputs.items():
+                if isinstance(tensor, torch.Tensor):
+                    if name == "pixel_values" and self.vision_cpu:
+                        inputs[name] = tensor.cpu()
+                    else:
+                        inputs[name] = tensor
+            logger.debug(
+                "Processor tensors prepared. pixel_values=%s, input_ids=%s",
+                inputs.get("pixel_values").device if "pixel_values" in inputs else "N/A",
+                inputs.get("input_ids").device if "input_ids" in inputs else "N/A",
+            )
             
+            # Ensure pixel tensor device matches vision tower
+            if self.vision_cpu and "pixel_values" in inputs:
+                inputs["pixel_values"] = inputs["pixel_values"].cpu()
             # Handle vision processing compatibility for Apple Silicon
             # If we've encountered the attention head mismatch before, process vision on CPU
-            if self.use_cpu_for_vision and "pixel_values" in inputs:
+            if (self.use_cpu_for_vision or self.vision_cpu) and "pixel_values" in inputs:
                 logger.debug("Using CPU for vision processing due to previous attention head mismatch")
                 # Move only the pixel_values to CPU
                 for k in inputs.keys():
@@ -165,6 +198,7 @@ class GemmaEngine:
                         inputs[k] = inputs[k].cpu()
             
             # Use only supported generation parameters for Gemma 3n
+            logger.debug("Calling model.generate ...")
             try:
                 # Generate text with correct Gemma parameters
                 generation = self.model.generate(
@@ -186,6 +220,7 @@ class GemmaEngine:
                         inputs["pixel_values"] = inputs["pixel_values"].cpu()
                         
                         # Try again with pixel_values on CPU
+                        logger.debug("Retrying generate with pixel_values on CPU ...")
                         generation = self.model.generate(
                             **inputs,
                             max_new_tokens=256,
