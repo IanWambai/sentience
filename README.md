@@ -37,6 +37,8 @@ Sentience is an offline cognition engine that:
    python -m sentience
    ```
 
+**Note:** On first run, Sentience will automatically download the Gemma 3n model (approximately 5GB). This download happens only once and the model will be stored locally for future use.
+
 ## Performance Metrics
 
 | Metric | Target | Description |

@@ -35,14 +35,16 @@ class GemmaEngine:
         print(f"Loading Gemma 3n processor from {model_path}...")
         self.processor = AutoProcessor.from_pretrained(
             model_path, 
-            local_files_only=True
+            local_files_only=True,
+            trust_remote_code=True
         )
         
         print(f"Loading Gemma 3n model (int4) from {model_path} to {device}...")
         self.model = AutoModelForMultimodalLLM.from_pretrained(
             model_path,
             quantization_config=Int4Config(),
-            local_files_only=True
+            local_files_only=True,
+            trust_remote_code=True
         )
         self.model.to(device)
         self.model.eval()

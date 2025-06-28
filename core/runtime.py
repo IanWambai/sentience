@@ -14,6 +14,7 @@ from pathlib import Path
 from .model_interface import GemmaEngine
 from .vision import CameraFeed
 from .streamer import ThoughtSink
+from .downloader import AssetManager
 
 
 class Initialiser:
@@ -73,12 +74,11 @@ def run():
     initializer = Initialiser(device_preference="mps")
     device = initializer.device
     
-    # Set up model
-    model_path = os.path.abspath(os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "weights", "gemma_e2b_int4"
-    ))
+    # Ensure model is downloaded
+    asset_manager = AssetManager()
+    model_path = asset_manager.ensure_model_available()
     
+    # Set up model engine
     engine = GemmaEngine(model_path=model_path, device=device)
     
     # Set up camera

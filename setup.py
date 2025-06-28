@@ -19,6 +19,7 @@ setup(
         'pillow>=10.3.0',
         'opencv-python>=4.9.0',
         'psutil>=5.9.0',
+        'huggingface_hub>=0.20.0',
     ],
     python_requires='>=3.10',
     platforms=["MacOS"],
