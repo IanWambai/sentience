@@ -74,7 +74,7 @@ class AssetManager:
             snapshot_download(
                 repo_id=self.MODEL_ID,
                 local_dir=str(self.model_path),
-                ignore_patterns=["*.safetensors.index.json"],  # Exclude unnecessary files
+                ignore_patterns=["*.bin*", "*.gguf"],  # Exclude non-safetensor model files
                 local_dir_use_symlinks=False,  # Full download, not symlinks
                 tqdm_class=tqdm,  # Show progress bar
                 max_workers=4,  # Optimize download speed
@@ -118,7 +118,8 @@ class AssetManager:
             return False
         
         # Check for essential model files
-        required_files = ["config.json", "model.safetensors", "preprocessor_config.json"]
+        # For sharded models, the index file is the key verification target
+        required_files = ["config.json", "model.safetensors.index.json", "preprocessor_config.json"]
         for file in required_files:
             if not (self.model_path / file).exists():
                 logger.debug(f"Missing required model file: {file}")
