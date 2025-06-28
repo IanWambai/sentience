@@ -17,11 +17,23 @@ from torchvision.transforms.functional import to_pil_image
 from transformers import (
     AutoProcessor, 
     AutoModelForCausalLM, 
-    AutoModelForMultimodalLM, 
     TextStreamer
 )
-from transformers.quantization import Int4Config
-from transformers.utils import BitsAndBytesConfig
+
+# Handle different imports for different transformers versions
+# Gracefully handle missing components for compatibility
+try:
+    from transformers.quantization import Int4Config
+except ImportError:
+    Int4Config = None
+    
+try:
+    from transformers.utils import BitsAndBytesConfig
+except ImportError:
+    try:
+        from transformers import BitsAndBytesConfig
+    except ImportError:
+        BitsAndBytesConfig = None
 from PIL import Image
 from typing import Optional, Dict, Any, Union, Tuple
 
@@ -32,7 +44,7 @@ class GemmaEngine:
     A robust wrapper for the Gemma 3n multimodal model.
     Handles model loading, inference, and gracefully manages errors.
     
-    Using Gemma 3n-E2B-int4 model for MPS GPU compatibility:
+    Using Gemma 3n-E2B model for MPS GPU compatibility:
     - Uses 256-dim attention heads fully supported by the MPS SDPA kernel
     - Runs vision and audio towers on CPU, language model on MPS GPU
     - Transfers processed vision/audio embeddings to GPU once per frame (≈0.2ms)
@@ -83,17 +95,25 @@ class GemmaEngine:
             import os
             os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
             
-            logger.info("Loading E2B-int4 model weights into system RAM first...")
-            # Configure int4 quantization for the model
-            int4_config = Int4Config()
+            logger.info("Loading Gemma 3n-E2B model weights into system RAM first...")
+            # Configure quantization options based on available imports
+            quantization_config = None
+            if Int4Config is not None:
+                # Use int4 quantization if available
+                quantization_config = Int4Config()
+                logger.info("✓ Using Int4 quantization for model loading")
+            else:
+                # Fallback to BitsAndBytes for older transformers
+                logger.info("⚠️ Int4Config not available, using standard loading")
             
-            # Use proper MultimodalLM class with int4 quantization config
-            self.model = AutoModelForMultimodalLM.from_pretrained(
+            # Load model with the appropriate class - AutoModelForCausalLM handles multimodal models too
+            self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_path,
-                torch_dtype=torch.float16,  # Use float16 for E2B-int4 model - faster and sufficient precision
-                low_cpu_mem_usage=True,      # Keep this for efficient loading into RAM
+                torch_dtype=torch.float16,  # Use float16 for E2B-int4 model
+                low_cpu_mem_usage=True,     # Efficient RAM usage
                 local_files_only=True,
-                quantization_config=int4_config
+                quantization_config=quantization_config,
+                trust_remote_code=True      # Required for some model architectures
             )
             logger.info("✓ Model loaded into RAM. Setting up hybrid CPU/MPS configuration...")
             

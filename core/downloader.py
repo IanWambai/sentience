@@ -30,10 +30,10 @@ class AssetManager:
     """
     
     # Model constants
-    # Using the E2B-int4 model with 256-dim attention heads for MPS compatibility
-    MODEL_ID = "google/gemma-3n-E2B-int4"
-    WEIGHTS_DIR = "weights/gemma_e2b_int4"
-    MODEL_SIZE_GB = 2.0   # E2B-int4 is ~2GB, much smaller than E4B
+    # Using the E2B model with 256-dim attention heads for MPS compatibility
+    MODEL_ID = "google/gemma-3n-E2B"  # This is the correct Hugging Face repository name
+    WEIGHTS_DIR = "weights/gemma_e2b"
+    MODEL_SIZE_GB = 2.0   # E2B model is ~2GB, much smaller than E4B
     REQUIRED_MEMORY_GB = 8.0  # E2B model requires less RAM
     
     def __init__(self):
