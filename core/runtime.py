@@ -6,15 +6,21 @@ perception-inference loop.
 """
 
 import os
+import sys
 import time
 import torch
 import psutil
+import logging
 from pathlib import Path
 
 from .model_interface import GemmaEngine
 from .vision import CameraFeed
+from .audio import AudioStream
 from .streamer import ThoughtSink
 from .downloader import AssetManager
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 
 class Initialiser:
@@ -61,7 +67,7 @@ class Initialiser:
         return mission
 
 
-def run():
+def run(test_mode=False, enable_audio=True):
     """
     Primary entry point for Sentience.
     
@@ -71,21 +77,49 @@ def run():
     start_time = time.time()
     
     # Initialize system
-    initializer = Initialiser(device_preference="mps")
-    device = initializer.device
+    try:
+        initializer = Initialiser(device_preference="mps")
+        device = initializer.device
+    except RuntimeError as e:
+        logger.critical(f"❌ System initialization failed: {e}")
+        sys.exit(1)
     
     # Ensure model is downloaded
-    asset_manager = AssetManager()
-    model_path = asset_manager.ensure_model_available()
+    try:
+        asset_manager = AssetManager()
+        model_path = asset_manager.ensure_model_available()
+    except SystemExit:
+        # Asset manager handles its own exit on critical download failure
+        return
     
     # Set up model engine
-    engine = GemmaEngine(model_path=model_path, device=device)
+    try:
+        engine = GemmaEngine(model_path=model_path, device=device)
+    except Exception as e:
+        logger.critical(f"❌ Failed to load GemmaEngine: {e}")
+        sys.exit(1)
     
     # Set up camera
-    camera = CameraFeed(device=device)
+    try:
+        camera = CameraFeed(device=device, test_mode=test_mode)
+    except RuntimeError as e:
+        logger.critical(f"❌ Failed to initialize camera: {e}")
+        sys.exit(1)
+        
+    # Set up audio if enabled
+    audio_stream = None
+    if enable_audio:
+        try:
+            logger.info("Initializing audio stream...")
+            audio_stream = AudioStream(test_mode=test_mode)
+            logger.info("✓ Audio capture initialized")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to initialize audio: {e}")
+            logger.warning("Continuing without audio capability")
+            enable_audio = False
     
-    # Set up output stream
-    thought_sink = ThoughtSink()
+    # Set up output stream with colors
+    thought_sink = ThoughtSink(use_colors=True)
     
     # Report cold boot time
     cold_boot_time = time.time() - start_time
@@ -97,56 +131,96 @@ def run():
     
     # Main loop
     try:
-        print("\nStarting continuous perception-inference loop...\n")
+        logger.info("🚀 Starting continuous perception-inference loop...\n")
         
         while True:
             loop_start_time = time.time()
             
-            # 1. Capture frame
-            frame = camera.get_frame()
-            
-            # 2. Describe scene
-            scene_text = engine.describe_scene(frame)
-            
-            # 3. Plan action based on scene
-            plan_text = engine.plan_action(scene_text)
-            
-            # 4. Emit thought
-            thought_sink.emit(scene_text, plan_text)
-            
+            try:
+                # 1. Capture inputs (frame and audio)
+                frame = camera.get_frame()
+                
+                # Get audio if available
+                audio_tensor = None
+                if enable_audio and audio_stream:
+                    audio_tensor = audio_stream.get_audio(device=device)
+                    
+                # 2. Describe scene with multimodal input
+                scene_text = engine.describe_scene(
+                    image=frame,
+                    audio=audio_tensor,
+                    audio_sampling_rate=16000 if audio_tensor is not None else None
+                )
+                
+                # 3. Plan action based on scene
+                plan_text = engine.plan_action(scene_text)
+                
+                # 4. Emit thought
+                thought_sink.emit(scene_text, plan_text)
+
+            except Exception as e:
+                logger.error(f"An error occurred in the main loop: {e}", exc_info=True)
+                time.sleep(2) # Cooldown to prevent rapid-fire errors
+                continue
+
             # Performance monitoring
             iteration_count += 1
             
             if iteration_count == 1:
                 first_thought_time = time.time() - start_time
-                print(f"[Performance] First thought time: {first_thought_time:.2f}s")
+                logger.info(f"📊 [Performance] First thought generated in: {first_thought_time:.2f}s")
             
             if iteration_count == 10:
                 # Check memory usage after 10 iterations
                 process = psutil.Process(os.getpid())
                 memory_mb = process.memory_info().rss / (1024 * 1024)
-                print(f"[Performance] Memory usage after 10 iterations: {memory_mb:.2f} MB")
+                logger.info(f"📊 [Performance] Memory usage after 10 iterations: {memory_mb:.2f} MB")
                 
-            if iteration_count == 240:  # After 60 seconds at 4 Hz
+            if iteration_count > 0 and iteration_count % 240 == 0:  # Every ~60 seconds
                 duration = time.time() - throughput_start_time
                 throughput = iteration_count / duration
-                print(f"[Performance] Sustained throughput: {throughput:.2f} thoughts/second")
+                logger.info(f"📊 [Performance] Sustained throughput: {throughput:.2f} thoughts/sec over {duration:.0f}s")
             
-            # 5. Sleep if needed to maintain ~5Hz
+            # 5. Dynamic Sleep to maintain ~5Hz
             elapsed = time.time() - loop_start_time
-            sleep_time = max(0, 0.2 - elapsed)  # Target 5Hz (200ms per loop)
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+            sleep_time = max(0, 0.2 - elapsed)  # Target 200ms per loop
+            time.sleep(sleep_time)
             
     except KeyboardInterrupt:
-        print("\nSentience shutting down gracefully...")
+        logger.info("\n🛑 User requested shutdown. Exiting gracefully...")
     finally:
         # Final performance report
         total_runtime = time.time() - start_time
-        print(f"\nTotal runtime: {total_runtime:.2f}s")
-        print(f"Total thoughts generated: {iteration_count}")
-        print(f"Average throughput: {iteration_count / total_runtime:.2f} thoughts/second")
+        logger.info("="*50)
+        logger.info("SESSION SUMMARY")
+        logger.info("="*50)
+        logger.info(f"Total runtime: {total_runtime:.2f}s")
+        logger.info(f"Total thoughts generated: {iteration_count}")
+        if total_runtime > 1:
+            avg_throughput = iteration_count / total_runtime
+            logger.info(f"Average throughput: {avg_throughput:.2f} thoughts/sec")
+            
+        # Clean up resources
+        if enable_audio and audio_stream:
+            audio_stream.close()
+            
+        logger.info("Sentience has shut down.")
 
 
 if __name__ == "__main__":
-    run()
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Sentience: Multimodal AI Cognition Engine')
+    parser.add_argument('--test', action='store_true', help='Run in test mode with synthetic inputs')
+    parser.add_argument('--no-audio', action='store_true', help='Disable audio input')
+    parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
+                        help='Set the logging level')
+    
+    args = parser.parse_args()
+    
+    # Configure logging
+    logging.basicConfig(level=getattr(logging, args.log_level),
+                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    # Run with parsed arguments
+    run(test_mode=args.test, enable_audio=not args.no_audio)

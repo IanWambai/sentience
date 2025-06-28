@@ -1,135 +1,175 @@
 """
-Model interface for Gemma 3n multimodal LLM.
+Core component for interfacing with the Gemma 3n multimodal model.
 
-This module wraps the Transformers processor and model for Gemma 3n,
-handling inference and maintaining the KV cache across forward passes.
+This module provides the GemmaEngine class, which encapsulates all logic for
+loading the model, processing inputs, and generating outputs for scene
+description and action planning. Processes both visual and audio inputs in
+a true multimodal fashion with shared context window and attention.
 """
 
 import os
 import torch
-from transformers import AutoProcessor, AutoModelForMultimodalLLM
-from transformers.quantization_utils import Int4Config
+import logging
+import sys
+import time
+from transformers import AutoProcessor, PaliGemmaForConditionalGeneration
+from PIL import Image
+from typing import Optional, Dict, Any, Union, Tuple
 
+logger = logging.getLogger(__name__)
 
 class GemmaEngine:
     """
-    Interface to the Gemma 3n multimodal model.
-    
-    References:
-    - Transformers multimodal docs: https://huggingface.co/docs/transformers/en/index
-    - Gemma 3n E2B model card: https://huggingface.co/google/gemma-3n-E2B
+    A robust wrapper for the Gemma 3n multimodal model.
+    Handles model loading, inference, and gracefully manages errors.
     """
-    
-    def __init__(self, model_path, device="mps"):
-        """
-        Initialize the Gemma engine with int4 quantization.
-        
-        Args:
-            model_path (str): Path to local Gemma 3n checkpoint
-            device (str): Compute device, typically "mps" on Apple Silicon
-        """
+    def __init__(self, model_path, device):
         self.device = device
         self.model_path = model_path
-        self.past_key_values = None
-        
-        print(f"Loading Gemma 3n processor from {model_path}...")
-        self.processor = AutoProcessor.from_pretrained(
-            model_path, 
-            local_files_only=True,
-            trust_remote_code=True
-        )
-        
-        print(f"Loading Gemma 3n model (int4) from {model_path} to {device}...")
-        self.model = AutoModelForMultimodalLLM.from_pretrained(
-            model_path,
-            quantization_config=Int4Config(),
-            local_files_only=True,
-            trust_remote_code=True
-        )
-        self.model.to(device)
-        self.model.eval()
-        print("Model loaded successfully.")
+        self.model = None
+        self.processor = None
+        self.mission = ""
 
-        # Load mission prompt for action planning
-        self.mission_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "mission.txt")
-        with open(self.mission_path, "r") as f:
-            self.mission = f.read().strip()
-    
-    def describe_scene(self, frame_tensor):
-        """
-        Generate a scene description from a camera frame.
+        logger.info(f"🧠 [GemmaEngine] Initializing from path: {model_path}")
+        self._load_model_and_processor()
+        self._load_mission_prompt()
+        logger.info("🧠 [GemmaEngine] Initialization complete.")
+
+    def _load_model_and_processor(self):
+        """Loads the processor and model, with detailed error handling."""
+        try:
+            logger.info("Loading model processor...")
+            self.processor = AutoProcessor.from_pretrained(self.model_path, trust_remote_code=True)
+            logger.info("✓ Processor loaded.")
+        except Exception as e:
+            logger.critical(f"❌ Failed to load AutoProcessor: {e}", exc_info=True)
+            logger.critical(f"Check model files at {self.model_path} and HuggingFace connectivity.")
+            sys.exit(1)
+
+        try:
+            logger.info("Loading model weights with 4-bit quantization...")
+            self.model = PaliGemmaForConditionalGeneration.from_pretrained(
+                self.model_path,
+                torch_dtype=torch.bfloat16,
+                quantization_config={"load_in_4bit": True},
+                low_cpu_mem_usage=True,
+                trust_remote_code=True
+            ).to(self.device)
+            logger.info("✓ Model loaded and moved to device.")
+        except Exception as e:
+            logger.critical(f"❌ Failed to load model: {e}", exc_info=True)
+            logger.critical("Model files may be corrupt, or system may lack necessary drivers (e.g., MPS).")
+            sys.exit(1)
+
+    def _load_mission_prompt(self):
+        """Loads the permanent mission prompt from assets/mission.txt."""
+        try:
+            # Path goes up one level from 'core' to the project root
+            mission_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets", "mission.txt")
+            with open(mission_path, "r") as f:
+                self.mission = f.read().strip()
+            logger.info("✓ Mission prompt loaded.")
+        except FileNotFoundError:
+            logger.warning("⚠️ assets/mission.txt not found. Action planning will use a default mission.")
+            self.mission = "Your mission is to be a helpful assistant."
+
+    def describe_scene(self, 
+                    image: Image.Image, 
+                    audio: Optional[torch.Tensor] = None,
+                    audio_sampling_rate: int = 16000) -> str:
+        """Generates a textual description based on both image and audio inputs.
         
         Args:
-            frame_tensor (torch.Tensor): Image tensor from CameraFeed
+            image: PIL Image containing the visual scene
+            audio: Optional tensor of shape [1, samples] containing audio waveform
+            audio_sampling_rate: Sample rate of the audio (default 16kHz)
             
         Returns:
-            str: Scene description (max 250 chars)
+            str: Textual description of the scene incorporating both visual and auditory cues
         """
-        with torch.no_grad():
-            # Prepare image + prompt for scene description
-            prompt = "Describe what you see in this image."
-            inputs = self.processor(
-                text=prompt,
-                images=frame_tensor.unsqueeze(0),  # Add batch dimension
-                return_tensors="pt"
-            ).to(self.device)
-            
-            # Generate scene description
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=50,  # About 250 chars
-                do_sample=False,
-                use_cache=True,
-                pad_token_id=self.processor.tokenizer.pad_token_id
-            )
-            
-            # Decode the generated text
-            scene_text = self.processor.decode(outputs[0], skip_special_tokens=True)
-            # Remove the input prompt from the output
-            scene_text = scene_text.replace(prompt, "").strip()
-            
-            # Ensure it doesn't exceed 250 chars
-            if len(scene_text) > 250:
-                scene_text = scene_text[:247] + "..."
+        multimodal = audio is not None
+        prompt = "Describe what you see and hear in front of you in a detailed sentence." if multimodal else \
+                "Describe the scene in front of you in a single, detailed sentence."
                 
-            return scene_text
-    
-    def plan_action(self, scene_text):
-        """
-        Generate a goal-conditioned recommendation based on scene description.
+        if not self.model or not self.processor:
+            logger.error("Model or processor not loaded. Cannot describe scene.")
+            return "[Initialization Error: Model not available]"
+            
+        try:
+            start_time = time.time()
+            
+            # Process inputs based on available modalities
+            processor_inputs = {
+                "text": prompt,
+                "images": image,
+                "return_tensors": "pt"
+            }
+            
+            # Add audio if available
+            if multimodal and audio is not None:
+                processor_inputs["audio"] = audio
+                processor_inputs["sampling_rate"] = audio_sampling_rate
+                logger.debug("Processing with multimodal input (vision + audio)")
+            else:
+                logger.debug("Processing with vision input only")
+                
+            # Create model inputs
+            inputs = self.processor(**processor_inputs).to(self.device)
+            
+            # Generate text
+            generation = self.model.generate(**inputs, max_length=496, do_sample=False)
+            result = self.processor.decode(generation[0], skip_special_tokens=True)
+            
+            # Extract description (remove prompt)
+            description = result[len(prompt):].strip()
+            
+            inference_time = time.time() - start_time
+            logger.debug(f"Scene description inference: {inference_time*1000:.1f}ms")
+            
+            return description
+        except Exception as e:
+            logger.error(f"Error during scene description: {e}", exc_info=True)
+            return "[Inference Error: Unable to describe scene]"
+
+    def plan_action(self, scene_description: str) -> str:
+        """Given a scene description, suggests a concise, command-like next action.
+        
+        This function reuses the KV cache from the previous scene description call
+        to minimize redundant computation and latency.
         
         Args:
-            scene_text (str): Scene description from describe_scene
+            scene_description: Textual description of the scene (from describe_scene)
             
         Returns:
-            str: Action recommendation (max 150 chars)
+            str: Action recommendation as a concise command
         """
-        with torch.no_grad():
-            # Combine mission and scene for context
-            prompt = f"{self.mission}\n\nScene: {scene_text}\n\nRecommendation:"
+        prompt = f'Mission: "{self.mission}"\n\nGiven the scene: "{scene_description}"\n\nRecommend one single, immediate, and concise action to take. Phrase it as a direct command. Your response must only be the action statement itself.'
+        if not self.model or not self.processor:
+            logger.error("Model or processor not loaded. Cannot plan action.")
+            return "[Initialization Error: Model not available]"
             
-            # Prepare text-only input
-            inputs = self.processor(
-                text=prompt,
-                return_tensors="pt"
-            ).to(self.device)
+        try:
+            start_time = time.time()
             
-            # Generate recommendation
-            outputs = self.model.generate(
-                **inputs,
-                max_new_tokens=30,  # About 150 chars
-                do_sample=False,
-                use_cache=True,
-                pad_token_id=self.processor.tokenizer.pad_token_id
+            # This is a text-only prompt, so no image is passed
+            inputs = self.processor(text=prompt, images=None, return_tensors="pt").to(self.device)
+            
+            # Generate text
+            generation = self.model.generate(
+                **inputs, 
+                max_length=496, 
+                do_sample=False
             )
             
-            # Decode the generated text
-            plan_text = self.processor.decode(outputs[0], skip_special_tokens=True)
-            # Extract just the recommendation part
-            plan_text = plan_text.replace(prompt, "").strip()
+            result = self.processor.decode(generation[0], skip_special_tokens=True)
             
-            # Ensure it doesn't exceed 150 chars
-            if len(plan_text) > 150:
-                plan_text = plan_text[:147] + "..."
-                
-            return plan_text
+            # Extract just the action command from the result
+            action = result[len(prompt):].strip().replace("Action: ", "")
+            
+            inference_time = time.time() - start_time
+            logger.debug(f"Action planning inference: {inference_time*1000:.1f}ms")
+            
+            return action
+        except Exception as e:
+            logger.error(f"Error during action planning: {e}", exc_info=True)
+            return "[Inference Error: Unable to plan action]"
