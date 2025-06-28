@@ -147,9 +147,38 @@ class GemmaEngine:
                         core = self.model.model.language_model
                         logger.info(f"🔄 Moving language model to MPS: {type(core).__name__}")
                         # E2B model's 256-dim heads are fully compatible with MPS SDPA kernel
-                        core.to("mps", dtype=torch.float16)
                         self.hybrid_execution = True
-                        logger.info("✓ Language model successfully moved to MPS GPU")
+                        self.vision_cpu = True
+                        
+                        logger.info("Hybrid CPU/MPS execution mode enabled. Moving language model to MPS...")
+                        
+                        # Explicitly ensure vision and audio towers stay on CPU first
+                        try:
+                            # Move the whole model to CPU first to ensure clean state
+                            self.model = self.model.to("cpu")
+                            
+                            # Make sure vision tower and all its submodules are explicitly on CPU
+                            if hasattr(self.model.model.model, 'vision_tower'):
+                                self.model.model.model.vision_tower = self.model.model.model.vision_tower.to("cpu")
+                                logger.info("✅ Explicitly placed vision tower on CPU")
+                            
+                            # Make sure audio tower and all its submodules are explicitly on CPU
+                            if hasattr(self.model.model.model, 'audio_tower'):
+                                self.model.model.model.audio_tower = self.model.model.model.audio_tower.to("cpu")
+                                logger.info("✅ Explicitly placed audio tower on CPU")
+                            
+                            # Now move only the language model to MPS
+                            # Note: model.model.language_model is the path to the actual LM in Gemma 3n
+                            self.model.model.model.language_model = self.model.model.model.language_model.to(
+                                'mps', dtype=torch.float16)
+                            logger.info("✅ Successfully moved language model to MPS with float16 precision")
+                        except Exception as e:
+                            logger.error(f"Error during hybrid device placement: {e}")
+                            logger.warning("Falling back to full CPU execution")
+                            self.model = self.model.to("cpu")
+                            self.hybrid_execution = False
+                            self.device = "cpu"
+                            self.vision_cpu = True
                     else:
                         logger.warning("❌ Could not find model.model.language_model - falling back to CPU")
                         self.device = "cpu"
@@ -266,10 +295,16 @@ class GemmaEngine:
             if self.hybrid_execution and self.device == "mps":
                 transfer_start = time.time()
                 
-                # Move tensors to MPS individually to measure transfer time
+                # Move only specific tensors to MPS, keeping vision_input_ids and audio_input_ids on CPU
+                # This is critical for hybrid execution where vision/audio towers must stay on CPU
                 input_keys = list(inputs.keys())
                 for k in input_keys:
                     if isinstance(inputs[k], torch.Tensor):
+                        # Keep these specific tensor types on CPU for proper vision/audio tower execution
+                        if k in ['vision_input_ids', 'audio_input_ids']:
+                            logger.debug(f"Keeping {k} on CPU for tower processing")
+                            continue
+                            
                         tensor_size_mb = inputs[k].element_size() * inputs[k].numel() / (1024 * 1024)
                         before_transfer = time.time()
                         inputs[k] = inputs[k].to("mps")
