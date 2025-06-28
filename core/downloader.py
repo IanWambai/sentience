@@ -30,10 +30,11 @@ class AssetManager:
     """
     
     # Model constants
-    MODEL_ID = "google/gemma-3n-E4B"
-    WEIGHTS_DIR = "weights/gemma_e4b_int4"
-    MODEL_SIZE_GB = 16.0  # Approximate size for user information
-    REQUIRED_MEMORY_GB = 16.0  # On macOS, this is min TOTAL RAM. On other OS, it's min AVAILABLE RAM.
+    # Using the E2B-int4 model with 256-dim attention heads for MPS compatibility
+    MODEL_ID = "google/gemma-3n-E2B-int4"
+    WEIGHTS_DIR = "weights/gemma_e2b_int4"
+    MODEL_SIZE_GB = 2.0   # E2B-int4 is ~2GB, much smaller than E4B
+    REQUIRED_MEMORY_GB = 8.0  # E2B model requires less RAM
     
     def __init__(self):
         """Initialize the asset manager."""
