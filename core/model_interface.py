@@ -26,21 +26,27 @@ class GemmaEngine:
     Handles model loading, inference, and gracefully manages errors.
     """
     def __init__(self, model_path=None, device='mps'):
-        """Initialize the Gemma engine.
+        """
+        Initialize the Gemma engine.
         
         Args:
             model_path: Path to the model weights directory
             device: Device to run inference on ('cpu', 'cuda', 'mps')
         """
         self.model_path = model_path
-        self.device = device if torch.backends.mps.is_available() and device == 'mps' else 'cpu'
+        # Check for MPS availability and use it if available
+        self.use_mps = torch.backends.mps.is_available() and device == 'mps'
+        self.device = 'mps' if self.use_mps else 'cpu'
         self.model = None
         self.processor = None
         # Track if we need to use CPU for vision processing (Apple Silicon compatibility)
-        self.use_cpu_for_vision = False
+        self.vision_cpu = False
+        # Add a flag to track if we're using hybrid execution
+        self.hybrid_execution = False
         self.mission = ""
 
         logger.info(f"🧠 [GemmaEngine] Initializing from path: {model_path}")
+        logger.info(f"🧠 [GemmaEngine] Using device: {self.device} (MPS available: {torch.backends.mps.is_available()})")
         self._load_model_and_processor()
         self._load_mission_prompt()
         logger.info("🧠 [GemmaEngine] Initialization complete.")
@@ -57,34 +63,72 @@ class GemmaEngine:
             sys.exit(1)
 
         try:
+            # Enable MPS fallback for unsupported operations
+            import os
+            os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+            
             logger.info("Loading model weights into system RAM first...")
             # Load the model to CPU first to avoid direct-to-GPU allocation issues
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_path,
-                torch_dtype=torch.float32 if self.device == "cpu" else torch.bfloat16,
+                torch_dtype=torch.float32,  # Always use float32 for compatibility
                 low_cpu_mem_usage=True,  # Keep this for efficient loading into RAM
                 local_files_only=True
             )
-            logger.info("✓ Model loaded into RAM. Moving to MPS device...")
-            # Now, move the entire model to the MPS device
-            # On Apple Silicon keep whole model on CPU for stability
+            logger.info("✓ Model loaded into RAM. Setting up hybrid CPU/MPS configuration...")
+            
+            # Setup hybrid execution strategy for Apple Silicon
             if self.device == "mps":
-                logger.info("Keeping entire model on CPU to avoid mixed-device deadlock")
-                self.model.to("cpu")
-                # Ensure weights are float32 to avoid dtype mismatch with Conv2d
-                if self.model.dtype != torch.float32:
-                    self.model = self.model.float()
-                self.device = "cpu"
+                try:
+                    # First convert to float32 which has better MPS compatibility
+                    if self.model.dtype != torch.float32:
+                        self.model = self.model.float()
+                    
+                    # Keep the model initially on CPU
+                    self.model.to("cpu")
+                    
+                    # Move specific components to MPS for acceleration
+                    logger.info("Moving language model decoder layers to MPS device...")
+                    
+                    # Vision components stay on CPU to avoid attention issues
+                    self.vision_cpu = True
+                    if hasattr(self.model, "vision_tower"):
+                        logger.info("Keeping vision tower on CPU for compatibility")
+                        self.model.vision_tower.to("cpu")
+                        
+                    # Audio components also stay on CPU if they exist
+                    if hasattr(self.model, "audio_tower"):
+                        logger.info("Keeping audio tower on CPU for compatibility")
+                        self.model.audio_tower.to("cpu")
+                    
+                    # Move just the decoder (language) part to MPS which should be compatible
+                    if hasattr(self.model, "language_model") and hasattr(self.model.language_model, "model"):
+                        logger.info("Moving language model to MPS")
+                        self.model.language_model.model.to("mps")
+                    # For models with decoder blocks directly
+                    elif hasattr(self.model, "decoder"):
+                        logger.info("Moving decoder to MPS")
+                        self.model.decoder.to("mps")
+                    # For models with layers directly
+                    elif hasattr(self.model, "layers"):
+                        logger.info("Moving layers to MPS")
+                        self.model.layers.to("mps")
+                    else:
+                        logger.warning("Could not identify language components to move to MPS. Using full CPU fallback.")
+                        self.device = "cpu"
+                        
+                except Exception as e:
+                    logger.error(f"Error moving components to MPS: {e}")
+                    logger.warning("Falling back to CPU for all components")
+                    self.model.to("cpu")
+                    self.device = "cpu"
+                    self.vision_cpu = True
             else:
+                # Standard CPU path
                 self.model.to(self.device)
-            # Move language layers to device, but keep vision tower on CPU to avoid Apple Silicon attention mismatch
-            logger.debug("Placing vision_tower on CPU and language layers on %s", self.device)
-            if hasattr(self.model, "vision_tower") and self.device == "mps":
-                self.model.vision_tower.to("cpu")
-                self.vision_cpu = True
-                logger.info("✓ Vision tower kept on CPU for compatibility.")
-            else:
                 self.vision_cpu = False
+                
+            logger.info(f"✓ Model configuration complete. Using: CPU for vision/audio, {self.device} for language processing.")
             # Remove unsupported default generation params cleanly to silence warnings
             for bad_key in ("top_p", "top_k"):
                 if getattr(self.model.generation_config, bad_key, None) is not None:
