@@ -13,6 +13,7 @@ import logging
 import sys
 import time
 import numpy as np
+from torchvision.transforms.functional import to_pil_image
 from transformers import AutoProcessor, AutoModelForCausalLM, BitsAndBytesConfig
 from PIL import Image
 from typing import Optional, Dict, Any, Union, Tuple
@@ -112,6 +113,14 @@ class GemmaEngine:
             
         try:
             start_time = time.time()
+            
+            # Ensure image is in RGB and correct size expected by model (224x224)
+            if image is not None:
+                if isinstance(image, torch.Tensor):
+                    # Convert CHW -> HWC PIL image
+                    image = to_pil_image(image.cpu())
+                image = image.convert("RGB")
+                image = image.resize((224, 224))
             
             # Process inputs based on available modalities
             processor_inputs = {
