@@ -122,8 +122,9 @@ class GemmaEngine:
             str: Textual description of the scene incorporating both visual and auditory cues
         """
         multimodal = audio is not None
-        prompt = "Describe what you see and hear in front of you in a detailed sentence." if multimodal else \
-                "Describe the scene in front of you in a single, detailed sentence."
+        # Keep prompt very short - mission is handled elsewhere
+        # DO NOT add <image> token manually - let the processor do it
+        prompt = "Describe what you see" + (" and hear" if multimodal else "") + " in a detailed sentence."
                 
         if not self.model or not self.processor:
             logger.error("Model or processor not loaded. Cannot describe scene.")
@@ -141,12 +142,16 @@ class GemmaEngine:
                 image = image.resize((224, 224))
             
             # Process inputs based on available modalities
+            # Prepare inputs
+            # Use processor directly with the correct format
+            # No need to manually add image token - processor handles it
             processor_inputs = {
                 "text": prompt,
                 "images": image,
                 "return_tensors": "pt"
             }
-            
+            logger.debug("Using prompt with image token: %s", prompt[:50] + "...")
+
             # Add audio if available
             if multimodal and audio is not None:
                 # Move audio to CPU before processing
@@ -169,33 +174,25 @@ class GemmaEngine:
 
             else:
                 logger.debug("Processing with vision input only")
-                
-            # Create model inputs on CPU first then move tensors to appropriate devices
+            
+            # Create model inputs using processor
+            logger.debug(f"Running processor with inputs: {type(processor_inputs)}")
             inputs = self.processor(**processor_inputs)
-            # Since model is on CPU, keep all tensors on CPU to match
-            for name, tensor in inputs.items():
-                if isinstance(tensor, torch.Tensor):
-                    if name == "pixel_values" and self.vision_cpu:
-                        inputs[name] = tensor.cpu()
-                    else:
-                        inputs[name] = tensor
+            logger.debug(f"Processor output types: {type(inputs)}")
+            
+            # Place inputs on the appropriate device(s)
+            for key in inputs:
+                # Keep pixel_values on CPU if vision_cpu is True
+                if key == "pixel_values" and self.vision_cpu:
+                    inputs[key] = inputs[key].cpu()
+                else:
+                    inputs[key] = inputs[key].to(self.device)
+            
             logger.debug(
                 "Processor tensors prepared. pixel_values=%s, input_ids=%s",
                 inputs.get("pixel_values").device if "pixel_values" in inputs else "N/A",
                 inputs.get("input_ids").device if "input_ids" in inputs else "N/A",
             )
-            
-            # Ensure pixel tensor device matches vision tower
-            if self.vision_cpu and "pixel_values" in inputs:
-                inputs["pixel_values"] = inputs["pixel_values"].cpu()
-            # Handle vision processing compatibility for Apple Silicon
-            # If we've encountered the attention head mismatch before, process vision on CPU
-            if (self.use_cpu_for_vision or self.vision_cpu) and "pixel_values" in inputs:
-                logger.debug("Using CPU for vision processing due to previous attention head mismatch")
-                # Move only the pixel_values to CPU
-                for k in inputs.keys():
-                    if k == "pixel_values":
-                        inputs[k] = inputs[k].cpu()
             
             # Use only supported generation parameters for Gemma 3n
             logger.debug("Calling model.generate ...")
@@ -203,32 +200,29 @@ class GemmaEngine:
                 # Generate text with correct Gemma parameters
                 generation = self.model.generate(
                     **inputs,
-                    max_new_tokens=256,  # Use max_new_tokens instead of max_length
+                    max_new_tokens=64,  # Start with fewer tokens for faster first response
                     do_sample=False,  # Use greedy decoding
                 )
             except RuntimeError as e:
                 error_msg = str(e)
                 if "number of heads in query/key/value should match" in error_msg:
-                    logger.warning("Detected attention head mismatch in vision component on Apple Silicon. Switching to CPU for vision processing...")
+                    logger.warning("Detected attention head mismatch in vision component on Apple Silicon. Moving entire model to CPU...")
                     
-                    # Remember to use CPU for vision in future calls
-                    self.use_cpu_for_vision = True
+                    # For the chat template approach, we need to move the entire model to CPU
+                    # since we can't separately handle pixel_values
+                    self.model = self.model.to('cpu')
+                    self.device = 'cpu'
                     
-                    # If we have an image, move it to CPU for processing
-                    if "pixel_values" in inputs:
-                        # Move only the pixel_values tensor to CPU
-                        inputs["pixel_values"] = inputs["pixel_values"].cpu()
-                        
-                        # Try again with pixel_values on CPU
-                        logger.debug("Retrying generate with pixel_values on CPU ...")
-                        generation = self.model.generate(
-                            **inputs,
-                            max_new_tokens=256,
-                            do_sample=False
-                        )
-                    else:
-                        # Re-raise if we can't handle this case
-                        raise
+                    # Move inputs to CPU
+                    inputs = inputs.to('cpu')
+                    
+                    # Try again with everything on CPU
+                    logger.debug("Retrying generate with all inputs on CPU...")
+                    generation = self.model.generate(
+                        **inputs,
+                        max_new_tokens=64,  # Start with fewer tokens for faster first response
+                        do_sample=False     # Use greedy decoding
+                    )
                 else:
                     # Re-raise for other errors
                     raise
