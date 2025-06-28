@@ -32,8 +32,8 @@ class AssetManager:
     # Model constants
     MODEL_ID = "google/gemma-3n-E4B"
     WEIGHTS_DIR = "weights/gemma_e4b_int4"
-    MODEL_SIZE_GB = 5.0  # Approximate size for user information
-    REQUIRED_MEMORY_GB = 3.0  # Minimum RAM required to run the model
+    MODEL_SIZE_GB = 16.0  # Approximate size for user information
+    REQUIRED_MEMORY_GB = 18.0  # Minimum RAM required to run the model
     
     def __init__(self):
         """Initialize the asset manager."""

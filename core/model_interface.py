@@ -52,8 +52,9 @@ class GemmaEngine:
                 self.model_path,
                 torch_dtype=torch.bfloat16,
                 device_map=self.device,
+                low_cpu_mem_usage=True,
                 local_files_only=True
-            ).to(self.device)
+            )
             logger.info("✓ Model loaded and moved to device.")
         except Exception as e:
             logger.critical(f"❌ Failed to load model: {e}", exc_info=True)
