@@ -1,15 +1,18 @@
-"""
-Setup script for Sentience package.
-"""
-
-from setuptools import setup, find_packages
+from setuptools import setup
 
 setup(
     name="sentience",
-    version="0.1.0",
-    packages=find_packages(),
+    version="0.2.0",
+    author="Cascade AI",
+    description="A multimodal AI agent for real-time perception and action.",
+    long_description=open('README.md').read(),
+    long_description_content_type="text/markdown",
+    packages=['sentience'],
     package_dir={'sentience': 'core'},
-    package_data={'sentience': ['assets/*', 'assets/mission.txt']},
+    package_data={
+        'sentience': ['assets/*'],
+    },
+    include_package_data=True,
     install_requires=[
         'torch>=2.3.0',
         'transformers>=4.44.0',
@@ -23,25 +26,15 @@ setup(
         'torchvision>=0.18.0',
         'timm>=0.9.12',
     ],
-    python_requires='>=3.9',
-    platforms=["MacOS"],
-    classifiers=[
-        'Development Status :: 4 - Beta',
-        'Intended Audience :: Developers',
-        'License :: OSI Approved :: Apache Software License',
-        'Programming Language :: Python :: 3',
-        'Programming Language :: Python :: 3.9',
-        'Programming Language :: Python :: 3.10',
-        'Programming Language :: Python :: 3.11',
-        'Operating System :: MacOS',
-    ],
-    description="Sentience - A production-grade multimodal cognition engine for Apple Silicon MacBooks",
-    long_description=open("README.md").read(),
-    long_description_content_type="text/markdown",
-    author="Sentience Team",
     entry_points={
         'console_scripts': [
-            'sentience=sentience.runtime:run',
+            'sentience = sentience.runtime:run',
         ],
     },
+    classifiers=[
+        "Programming Language :: Python :: 3.9",
+        "License :: OSI Approved :: MIT License",
+        "Operating System :: MacOS :: MacOS X",
+    ],
+    python_requires='>=3.9',
 )
