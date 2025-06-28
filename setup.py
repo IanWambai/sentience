@@ -7,11 +7,9 @@ from setuptools import setup, find_packages
 setup(
     name="sentience",
     version="0.1.0",
-    packages=find_packages(),
-    include_package_data=True,
-    package_data={
-        'sentience': ['assets/mission.txt'],
-    },
+    packages=['sentience'],
+    package_dir={'sentience': 'core'},
+    package_data={'sentience': ['assets/mission.txt']},
     install_requires=[
         'torch>=2.3.0',
         'transformers>=4.44.0',
@@ -41,7 +39,7 @@ setup(
     author="Sentience Team",
     entry_points={
         'console_scripts': [
-            'sentience=sentience:run',
+            'sentience=sentience.runtime:run',
         ],
     },
 )
