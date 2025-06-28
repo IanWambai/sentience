@@ -1,13 +1,14 @@
 # Sentience
 
-A production-grade cognition engine that brings your MacBook to life. Sentience loads Google's Gemma 3n, a multimodal transformer model, and performs continuous perception and reasoning based on webcam input.
+A production-grade cognition engine that brings your MacBook to life. Sentience loads Google's Gemma 3n, a multimodal transformer model, and performs continuous perception and reasoning based on webcam video and microphone audio input.
 
 ## Overview
 
 Sentience is an offline cognition engine that:
-- Captures webcam frames at ~5Hz
-- Processes images using Google's int4-quantized Gemma 3n model
+- Captures webcam frames and microphone audio at ~5Hz
+- Processes images and audio using Google's int4-quantized Gemma 3n model
 - Produces a continuous stream of scene descriptions and action recommendations
+- Processes visual and auditory information simultaneously
 - Operates autonomously without requiring user prompts
 
 ## System Requirements
@@ -15,8 +16,9 @@ Sentience is an offline cognition engine that:
 - Apple Silicon MacBook (M1/M2/M3)
 - macOS 13 or newer
 - Python 3.10 or 3.11
-- At least 4GB of free RAM
+- At least 4GB of free RAM (recommended 8GB+)
 - Integrated GPU (uses Apple MPS backend)
+- Working webcam and microphone (permissions will be requested)
 
 ## Installation
 
@@ -37,14 +39,26 @@ Sentience is an offline cognition engine that:
    python -m sentience
    ```
 
-**Note:** On first run, Sentience will automatically download the Gemma 3n model (approximately 5GB). This download happens only once and the model will be stored locally for future use.
+   Additional command-line options:
+   ```
+   # Run without audio processing
+   python -m sentience --no-audio
+   
+   # Run in test mode (synthetic inputs)
+   python -m sentience --test
+   
+   # Set logging verbosity
+   python -m sentience --log-level DEBUG
+   ```
+
+**Note:** On first run, Sentience will automatically download the Gemma 3n model (approximately 5GB) into the `weights/gemma_e2b_int4` directory. This download happens only once and the model will be stored locally for future use. The system will verify that you have sufficient memory before attempting to download.
 
 ## Performance Metrics
 
 | Metric | Target | Description |
 |--------|--------|-------------|
 | Cold load | <9s | Time from Python start to first thought output |
-| Memory usage | ≤2.5 GB | Steady-state RAM consumption after 10 iterations |
+| Memory usage | ≤3.0 GB | Steady-state RAM consumption after 10 iterations |
 | Throughput | ≥4 thoughts/sec | Sustained output rate for 60+ seconds |
 | Stability | 30+ min | Continuous operation without errors |
 
@@ -62,10 +76,12 @@ python setup.py bdist_wheel
 
 ## Architectural Components
 
-- **runtime.py**: Device detection, model loading, continuous loop
+- **runtime.py**: Device detection, model loading, continuous inference loop
 - **vision.py**: Camera capture and image preprocessing
-- **model_interface.py**: Gemma 3n model wrapper
+- **audio.py**: Microphone capture and audio processing
+- **model_interface.py**: Gemma 3n multimodal model wrapper
 - **streamer.py**: Thought formatting and output
+- **downloader.py**: Asset management and model downloading
 - **assets/mission.txt**: Core mission prompt that drives autonomous reasoning
 
 ## Acknowledgements & Licensing
