@@ -12,7 +12,7 @@ import torch
 import logging
 import sys
 import time
-from transformers import AutoProcessor, PaliGemmaForConditionalGeneration
+from transformers import AutoProcessor, AutoModelForCausalLM, BitsAndBytesConfig
 from PIL import Image
 from typing import Optional, Dict, Any, Union, Tuple
 
@@ -39,7 +39,7 @@ class GemmaEngine:
         """Loads the processor and model, with detailed error handling."""
         try:
             logger.info("Loading model processor...")
-            self.processor = AutoProcessor.from_pretrained(self.model_path, trust_remote_code=True)
+            self.processor = AutoProcessor.from_pretrained(self.model_path, local_files_only=True, trust_remote_code=True)
             logger.info("✓ Processor loaded.")
         except Exception as e:
             logger.critical(f"❌ Failed to load AutoProcessor: {e}", exc_info=True)
@@ -48,7 +48,7 @@ class GemmaEngine:
 
         try:
             logger.info("Loading model weights with 4-bit quantization...")
-            self.model = PaliGemmaForConditionalGeneration.from_pretrained(
+            self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_path,
                 torch_dtype=torch.bfloat16,
                 quantization_config={"load_in_4bit": True},
