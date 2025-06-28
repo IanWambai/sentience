@@ -33,7 +33,7 @@ class AssetManager:
     MODEL_ID = "google/gemma-3n-E4B"
     WEIGHTS_DIR = "weights/gemma_e4b_int4"
     MODEL_SIZE_GB = 16.0  # Approximate size for user information
-    REQUIRED_MEMORY_GB = 18.0  # Minimum RAM required to run the model
+    REQUIRED_MEMORY_GB = 16.0  # On macOS, this is min TOTAL RAM. On other OS, it's min AVAILABLE RAM.
     
     def __init__(self):
         """Initialize the asset manager."""
@@ -188,21 +188,26 @@ class AssetManager:
         """
         Check if the system has enough memory to run the model.
         
-        On macOS, this includes 'inactive' memory for a more accurate assessment.
+        On macOS (Apple Silicon), we check against the total physical memory,
+        as the OS handles memory management very efficiently. On other systems,
+        we check available memory.
 
         Returns:
             bool: True if system has enough memory, False otherwise
         """
         mem = psutil.virtual_memory()
         if platform.system() == "Darwin":  # macOS
-            # On macOS, 'available' can be misleading. A better measure is available + inactive.
-            available_memory = (mem.available + mem.inactive) / (1024.0 ** 3)
-        else:
+            total_memory_gb = mem.total / (1024.0 ** 3)
+            if total_memory_gb < self.REQUIRED_MEMORY_GB:
+                logger.error(f"Insufficient system memory: {total_memory_gb:.2f} GB total, but {self.REQUIRED_MEMORY_GB} GB is recommended to run this model.")
+                return False
+            logger.info(f"System memory check passed: {total_memory_gb:.2f} GB total memory detected.")
+            return True
+        else:  # Other OS
             available_memory = mem.available / (1024.0 ** 3)  # Convert to GB
+            if available_memory < self.REQUIRED_MEMORY_GB:
+                logger.error(f"Insufficient system memory: {available_memory:.2f} GB available, but {self.REQUIRED_MEMORY_GB} GB required")
+                return False
             
-        if available_memory < self.REQUIRED_MEMORY_GB:
-            logger.error(f"Insufficient system memory: {available_memory:.2f} GB available, but {self.REQUIRED_MEMORY_GB} GB required")
-            return False
-        
-        logger.info(f"System memory check passed: {available_memory:.2f} GB available.")
-        return True
+            logger.info(f"System memory check passed: {available_memory:.2f} GB available.")
+            return True

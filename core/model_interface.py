@@ -47,15 +47,18 @@ class GemmaEngine:
             sys.exit(1)
 
         try:
-            logger.info("Loading model weights...")
+            logger.info("Loading model weights into system RAM first...")
+            # Load the model to CPU first to avoid direct-to-GPU allocation issues
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_path,
                 torch_dtype=torch.bfloat16,
-                device_map=self.device,
-                low_cpu_mem_usage=True,
+                low_cpu_mem_usage=True,  # Keep this for efficient loading into RAM
                 local_files_only=True
             )
-            logger.info("✓ Model loaded and moved to device.")
+            logger.info("✓ Model loaded into RAM. Moving to MPS device...")
+            # Now, move the entire model to the MPS device
+            self.model.to(self.device)
+            logger.info("✓ Model successfully moved to device.")
         except Exception as e:
             logger.critical(f"❌ Failed to load model: {e}", exc_info=True)
             logger.critical("Model files may be corrupt, or system may lack necessary drivers (e.g., MPS).")
