@@ -47,13 +47,12 @@ class GemmaEngine:
             sys.exit(1)
 
         try:
-            logger.info("Loading model weights with 4-bit quantization...")
+            logger.info("Loading model weights...")
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_path,
                 torch_dtype=torch.bfloat16,
-                quantization_config={"load_in_4bit": True},
-                low_cpu_mem_usage=True,
-                trust_remote_code=True
+                device_map=self.device,
+                local_files_only=True
             ).to(self.device)
             logger.info("✓ Model loaded and moved to device.")
         except Exception as e:

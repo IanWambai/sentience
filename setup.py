@@ -21,7 +21,6 @@ setup(
         'pyaudio>=0.2.13',
         'tqdm>=4.66.1',
         'torchvision>=0.18.0',
-        'bitsandbytes==0.42.0',
     ],
     python_requires='>=3.9',
     platforms=["MacOS"],
