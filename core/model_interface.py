@@ -67,12 +67,15 @@ class GemmaEngine:
     def _load_mission_prompt(self):
         """Loads the permanent mission prompt from assets/mission.txt."""
         try:
-            # Path goes up one level from 'core' to the project root
-            mission_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "assets", "mission.txt")
-            with open(mission_path, "r") as f:
-                self.mission = f.read().strip()
+            # Use importlib.resources for robust package data access
+            # This ensures the file is found regardless of the execution context
+            from importlib import resources
+            
+            # The path is relative to the 'sentience' package
+            mission_content = resources.read_text('sentience.assets', 'mission.txt')
+            self.mission = mission_content.strip()
             logger.info("✓ Mission prompt loaded.")
-        except FileNotFoundError:
+        except (FileNotFoundError, ModuleNotFoundError):
             logger.warning("⚠️ assets/mission.txt not found. Action planning will use a default mission.")
             self.mission = "Your mission is to be a helpful assistant."
 

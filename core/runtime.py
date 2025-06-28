@@ -99,24 +99,39 @@ def run(test_mode=False, enable_audio=True):
         logger.critical(f"❌ Failed to load GemmaEngine: {e}")
         sys.exit(1)
     
-    # Set up camera
-    try:
-        camera = CameraFeed(device=device, test_mode=test_mode)
-    except RuntimeError as e:
-        logger.critical(f"❌ Failed to initialize camera: {e}")
+    # Set up camera with retries for permission handling
+    camera = None
+    for attempt in range(3):
+        try:
+            camera = CameraFeed(device=device, test_mode=test_mode)
+            if camera.is_opened():
+                logger.info("✓ Camera initialized successfully.")
+                break
+        except RuntimeError as e:
+            logger.warning(f"Camera initialization attempt {attempt + 1} failed: {e}")
+            time.sleep(2)  # Wait for permissions to propagate
+    
+    if not camera or not camera.is_opened():
+        logger.critical("❌ Failed to initialize camera after multiple attempts.")
         sys.exit(1)
         
-    # Set up audio if enabled
+    # Set up audio if enabled, with retries for permission handling
     audio_stream = None
     if enable_audio:
-        try:
-            logger.info("Initializing audio stream...")
-            audio_stream = AudioStream(test_mode=test_mode)
-            logger.info("✓ Audio capture initialized")
-        except Exception as e:
-            logger.warning(f"⚠️ Failed to initialize audio: {e}")
-            logger.warning("Continuing without audio capability")
-            enable_audio = False
+        for attempt in range(3):
+            try:
+                logger.info(f"Initializing audio stream (attempt {attempt + 1})...")
+                audio_stream = AudioStream(test_mode=test_mode)
+                logger.info("✓ Audio capture initialized")
+                break  # Success
+            except Exception as e:
+                logger.warning(f"⚠️ Audio initialization attempt {attempt + 1} failed: {e}")
+                if attempt < 2:
+                    time.sleep(2)  # Wait before retrying
+                else:
+                    logger.error("❌ Failed to initialize audio after multiple attempts. Continuing without audio.")
+                    audio_stream = None
+                    enable_audio = False
     
     # Set up output stream with colors
     thought_sink = ThoughtSink(use_colors=True)
