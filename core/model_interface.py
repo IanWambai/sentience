@@ -12,6 +12,7 @@ import torch
 import logging
 import sys
 import time
+import numpy as np
 from transformers import AutoProcessor, AutoModelForCausalLM, BitsAndBytesConfig
 from PIL import Image
 from typing import Optional, Dict, Any, Union, Tuple
@@ -115,19 +116,64 @@ class GemmaEngine:
             if multimodal and audio is not None:
                 # Move audio to CPU before processing
                 if hasattr(audio, 'device') and str(audio.device) != 'cpu':
-                    processor_inputs["audio"] = audio.cpu()
+                    audio_cpu = audio.cpu()
                 else:
-                    processor_inputs["audio"] = audio
+                    audio_cpu = audio
+                    
+                # Convert audio to numpy array if it's a tensor
+                if isinstance(audio_cpu, torch.Tensor):
+                    audio_cpu = audio_cpu.numpy()
+                
+                # Ensure correct shape for audio - Gemma expects raw 1D audio
+                if audio_cpu.ndim > 1 and audio_cpu.shape[0] == 1:  # If [1, length] shape
+                    audio_cpu = audio_cpu.squeeze(0)  # Convert to [length]
+                
+                processor_inputs["audio"] = audio_cpu
                 processor_inputs["sampling_rate"] = audio_sampling_rate
-                logger.debug("Processing with multimodal input (vision + audio)")
+                logger.debug(f"Processing with multimodal input (vision + audio), audio shape: {np.shape(audio_cpu)}")
+
             else:
                 logger.debug("Processing with vision input only")
                 
             # Create model inputs (all tensors should be on CPU at this point for the processor)
             inputs = self.processor(**processor_inputs).to(self.device)
             
-            # Generate text
-            generation = self.model.generate(**inputs, max_length=496, do_sample=False)
+            try:
+                # Generate text with correct Gemma parameters
+                generation = self.model.generate(
+                    **inputs,
+                    max_new_tokens=256,  # Use max_new_tokens instead of max_length
+                    do_sample=False,
+                    temperature=0.7,  # Standard temperature
+                    repetition_penalty=1.1  # Prevent repetition
+                )
+            except RuntimeError as e:
+                if "number of heads in query/key/value should match" in str(e):
+                    logger.warning("Detected attention head mismatch. Attempting fallback to CPU processing for vision component...")
+                    # If we have an image, move it to CPU for processing
+                    if "pixel_values" in inputs:
+                        # Create a copy of inputs without the problematic tensor
+                        cpu_inputs = {}
+                        for k, v in inputs.items():
+                            if k == "pixel_values":
+                                # Process only this tensor on CPU
+                                cpu_inputs[k] = v.cpu()
+                            else:
+                                cpu_inputs[k] = v
+                        
+                        generation = self.model.generate(
+                            **cpu_inputs,
+                            max_new_tokens=256,
+                            do_sample=False,
+                            temperature=0.7,
+                            repetition_penalty=1.1
+                        )
+                    else:
+                        # Re-raise if we can't handle this case
+                        raise
+                else:
+                    # Re-raise for other errors
+                    raise
             result = self.processor.decode(generation[0], skip_special_tokens=True)
             
             # Extract description (remove prompt)
