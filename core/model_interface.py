@@ -167,9 +167,15 @@ class GemmaEngine:
                 if isinstance(audio_cpu, torch.Tensor):
                     audio_cpu = audio_cpu.numpy()
                 
-                # Ensure correct shape for audio - Gemma expects raw 1D audio
-                if audio_cpu.ndim > 1 and audio_cpu.shape[0] == 1:  # If [1, length] shape
-                    audio_cpu = audio_cpu.squeeze(0)  # Convert to [length]
+                # Ensure the audio is mono (1-D). If stereo or batched, down-mix.
+                if audio_cpu.ndim > 1:
+                    if audio_cpu.shape[0] == 1:
+                        # Shape [1, length] -> [length]
+                        audio_cpu = audio_cpu.squeeze(0)
+                    else:
+                        # Stereo or multi-channel -> average across channels
+                        audio_cpu = audio_cpu.mean(axis=0)
+                # audio_cpu should now be shape [length]
                 
                 processor_inputs["audio"] = audio_cpu
                 processor_inputs["sampling_rate"] = audio_sampling_rate
