@@ -104,14 +104,14 @@ def run(test_mode=False, enable_audio=True):
     for attempt in range(3):
         try:
             camera = CameraFeed(device=device, test_mode=test_mode)
-            if camera.is_opened():
+            if camera.isOpened():
                 logger.info("✓ Camera initialized successfully.")
                 break
         except RuntimeError as e:
             logger.warning(f"Camera initialization attempt {attempt + 1} failed: {e}")
             time.sleep(2)  # Wait for permissions to propagate
     
-    if not camera or not camera.is_opened():
+    if not camera or not camera.isOpened():
         logger.critical("❌ Failed to initialize camera after multiple attempts.")
         sys.exit(1)
         

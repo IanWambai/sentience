@@ -113,13 +113,17 @@ class GemmaEngine:
             
             # Add audio if available
             if multimodal and audio is not None:
-                processor_inputs["audio"] = audio
+                # Move audio to CPU before processing
+                if hasattr(audio, 'device') and str(audio.device) != 'cpu':
+                    processor_inputs["audio"] = audio.cpu()
+                else:
+                    processor_inputs["audio"] = audio
                 processor_inputs["sampling_rate"] = audio_sampling_rate
                 logger.debug("Processing with multimodal input (vision + audio)")
             else:
                 logger.debug("Processing with vision input only")
                 
-            # Create model inputs
+            # Create model inputs (all tensors should be on CPU at this point for the processor)
             inputs = self.processor(**processor_inputs).to(self.device)
             
             # Generate text

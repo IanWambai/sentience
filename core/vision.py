@@ -135,6 +135,14 @@ class CameraFeed:
         # Save the image
         img.save(DEFAULT_IMAGE_PATH)
     
+    def isOpened(self):
+        """
+        Wrapper for the cv2.VideoCapture.isOpened() method.
+        Returns True if the camera is opened, False otherwise.
+        """
+        # The 'and' provides short-circuiting: if self.cap is None, it returns None (False-like)
+        return self.camera and self.camera.isOpened()
+
     def get_frame(self):
         """
         Grab a frame from the webcam and convert to tensor format.
