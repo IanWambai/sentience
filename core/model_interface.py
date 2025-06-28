@@ -14,8 +14,7 @@ import sys
 import time
 import numpy as np
 from torchvision.transforms.functional import to_pil_image
-from transformers import AutoProcessor, AutoModelForCausalLM, BitsAndBytesConfig, TextStreamer, TextIteratorStreamer
-import sys
+from transformers import AutoProcessor, AutoModelForCausalLM, BitsAndBytesConfig, TextStreamer
 from PIL import Image
 from typing import Optional, Dict, Any, Union, Tuple
 
@@ -134,6 +133,9 @@ class GemmaEngine:
             logger.error("Model or processor not loaded. Cannot describe scene.")
             return "[Initialization Error: Model not available]"
             
+        # Track if this is our first generation
+        first_run = not hasattr(self, '_first_generation_complete')
+            
         try:
             start_time = time.time()
             
@@ -216,28 +218,11 @@ class GemmaEngine:
             )
             
             # Use only supported generation parameters for Gemma 3n
-            # Set up a custom streamer that shows tokens with real-time logging
-            class CustomStreamer(TextIteratorStreamer):
-                def __init__(self, *args, **kwargs):
-                    super().__init__(*args, **kwargs)
-                    self.tokens_generated = 0
-                
-                def on_finalized_text(self, text, stream_end=False):
-                    super().on_finalized_text(text, stream_end)
-                    self.tokens_generated += 1
-                    # Print directly to stdout (bypassing logging) so it's immediately visible
-                    # Add a special marker so it stands out in the logs
-                    sys.stdout.write(f"\n💬 TOKEN: {text}\n")
-                    sys.stdout.flush()
-                    if stream_end:
-                        sys.stdout.write("\n[END OF STREAM]\n")
-                        sys.stdout.flush()
-            
-            streamer = CustomStreamer(
-                self.processor.tokenizer, 
-                skip_prompt=True, 
-                skip_special_tokens=True,
-                timeout=120.0  # Increase timeout to accommodate slow first token
+            # Set up standard TextStreamer with appropriate options
+            streamer = TextStreamer(
+                self.processor.tokenizer,
+                skip_prompt=True,
+                skip_special_tokens=True
             )
             logger.info("🌀 Starting model.generate with streaming... [first token may take several minutes]")
             try:
@@ -253,6 +238,9 @@ class GemmaEngine:
                 # Create a separate thread to monitor generation progress
                 def log_progress():
                     elapsed = 0
+                    # Adjust messaging based on whether this is first run or not
+                    msg_prefix = "first token" if first_run else "generation"
+                    
                     while elapsed < 600 and not generation_complete.is_set():  # Stop when complete or timeout
                         time.sleep(5)  # Check more frequently but only log every 30s
                         if generation_complete.is_set():
@@ -260,23 +248,74 @@ class GemmaEngine:
                             
                         elapsed = time.time() - gen_start
                         if elapsed >= 30 and elapsed % 30 < 5:  # Log at 30s intervals
-                            logger.info(f"⏳ Still waiting for first token... {elapsed:.1f} seconds elapsed")
+                            logger.info(f"⏳ Still waiting for {msg_prefix}... {elapsed:.1f} seconds elapsed")
                 
                 # Start progress monitoring in background thread
                 progress_thread = threading.Thread(target=log_progress, daemon=True)
                 progress_thread.start()
                 
-                # Try with a smaller max_new_tokens first for faster initial response
-                generation = self.model.generate(
-                    **inputs,
-                    max_new_tokens=16,  # Very short response for first run
-                    do_sample=False,    # Greedy decoding for deterministic, faster output
-                    streamer=streamer,  # Stream tokens to stdout for live progress
-                    temperature=0.0     # Zero temperature for fastest possible response
-                )
+                # Warm-up strategy: first run uses minimal settings for fastest possible response
+                # Subsequent runs use better settings for quality results
+                if first_run:
+                    logger.info("🔥 First generation - using ultra minimal settings for fastest warmup")
+                    generation = self.model.generate(
+                        **inputs,
+                        max_new_tokens=8,     # Absolute minimum tokens - just need to complete first compile
+                        do_sample=False,      # Greedy
+                        streamer=streamer     # Stream tokens
+                    )
+                    # Mark that we've completed first generation
+                    self._first_generation_complete = True
+                    
+                    # Stop the first progress thread
+                    generation_complete.set()
+                    
+                    # Now immediately do a second generation with better settings
+                    # This will be much faster since model is compiled and loaded
+                    logger.info("🚀 Initial warmup complete - now generating full response...")
+                    
+                    # Reset progress monitoring for full generation
+                    gen_start = time.time()
+                    generation_complete = threading.Event()
+                    
+                    # Create a new progress thread for the full generation
+                    def full_generation_progress():
+                        elapsed = 0
+                        while elapsed < 600 and not generation_complete.is_set():
+                            time.sleep(5)
+                            if generation_complete.is_set():
+                                break
+                                
+                            elapsed = time.time() - gen_start
+                            if elapsed >= 15 and elapsed % 15 < 5:  # Log more frequently for second run
+                                logger.info(f"⏳ Still generating response... {elapsed:.1f} seconds elapsed")
+                    
+                    # Start the full generation progress thread
+                    progress_thread = threading.Thread(target=full_generation_progress, daemon=True)
+                    progress_thread.start()
+                    generation = self.model.generate(
+                        **inputs,
+                        max_new_tokens=64,    # Full response
+                        do_sample=True,       # Enable sampling for better quality
+                        top_k=40,             # Reasonable sampling parameters
+                        top_p=0.9,
+                        streamer=streamer      # Stream tokens
+                    )
+                else:
+                    # Normal mode - model is already warmed up
+                    generation = self.model.generate(
+                        **inputs,
+                        max_new_tokens=64,    # Full response
+                        do_sample=True,       # Enable sampling for better quality
+                        top_k=40,             # Reasonable sampling parameters
+                        top_p=0.9,
+                        streamer=streamer      # Stream tokens
+                    )
                 
                 # Signal that generation is complete to stop the progress thread
                 generation_complete.set()
+                # Ensure the first progress thread terminates before starting phase-2 logs
+                progress_thread.join(timeout=1)
                 logger.info(f"✓ First generation completed in {time.time() - gen_start:.1f}s")
             except RuntimeError as e:
                 error_msg = str(e)
@@ -295,11 +334,10 @@ class GemmaEngine:
                     logger.info("Retrying generate with all inputs on CPU and streaming...")
                     
                     # Create a fresh streamer for the retry path
-                    retry_streamer = CustomStreamer(
-                        self.processor.tokenizer, 
-                        skip_prompt=True, 
-                        skip_special_tokens=True,
-                        timeout=120.0
+                    retry_streamer = TextStreamer(
+                        self.processor.tokenizer,
+                        skip_prompt=True,
+                        skip_special_tokens=True
                     )
                     
                     # Log precise timing for the retry generation call
@@ -318,23 +356,47 @@ class GemmaEngine:
                                 
                             elapsed = time.time() - gen_start
                             if elapsed >= 30 and elapsed % 30 < 5:  # Log at 30s intervals
-                                logger.info(f"⏳ [CPU] Still waiting for first token... {elapsed:.1f} seconds elapsed")
+                                logger.info(f"⏳ [CPU] Still waiting for {msg_prefix}... {elapsed:.1f} seconds elapsed")
                     
                     # Start CPU progress monitoring thread
                     cpu_progress_thread = threading.Thread(target=cpu_log_progress, daemon=True)
                     cpu_progress_thread.start()
                     
-                    # Stream tokens in the retry path too
-                    generation = self.model.generate(
-                        **inputs,
-                        max_new_tokens=16,  # Very short response for first run
-                        do_sample=False,    # Greedy decoding
-                        streamer=retry_streamer,  # Use new streamer
-                        temperature=0.0     # Zero temperature for fastest possible response
-                    )
+                    # CPU retry - use appropriate strategy based on first run status
+                    if first_run:
+                        generation = self.model.generate(
+                            **inputs,
+                            max_new_tokens=8,     # Minimal tokens for warmup
+                            do_sample=False,      # Greedy
+                            streamer=retry_streamer
+                        )
+                        # Mark that we've completed first generation
+                        self._first_generation_complete = True
+                        
+                        # Now immediately do a second generation with better settings
+                        logger.info("🚀 Initial CPU warmup complete - now generating full response...")
+                        generation = self.model.generate(
+                            **inputs,
+                            max_new_tokens=64,    # Full response
+                            do_sample=True,       # Better quality
+                            top_k=40,
+                            top_p=0.9,
+                            streamer=retry_streamer
+                        )
+                    else:
+                        # Normal mode for subsequent generations
+                        generation = self.model.generate(
+                            **inputs,
+                            max_new_tokens=64,    # Full response
+                            do_sample=True,       # Better quality
+                            top_k=40,
+                            top_p=0.9,
+                            streamer=retry_streamer
+                        )
                     
                     # Stop the CPU progress thread
                     cpu_generation_complete.set()
+                    
                     # Signal that generation is complete if we used the progress thread here too
                     if 'generation_complete' in locals():
                         generation_complete.set()
