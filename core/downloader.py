@@ -30,8 +30,8 @@ class AssetManager:
     """
     
     # Model constants
-    MODEL_ID = "google/gemma-3n-E2B"
-    WEIGHTS_DIR = "weights/gemma_e2b_int4"
+    MODEL_ID = "google/gemma-3n-E4B"
+    WEIGHTS_DIR = "weights/gemma_e4b_int4"
     MODEL_SIZE_GB = 5.0  # Approximate size for user information
     REQUIRED_MEMORY_GB = 3.0  # Minimum RAM required to run the model
     
