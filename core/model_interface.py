@@ -24,11 +24,19 @@ class GemmaEngine:
     A robust wrapper for the Gemma 3n multimodal model.
     Handles model loading, inference, and gracefully manages errors.
     """
-    def __init__(self, model_path, device):
-        self.device = device
+    def __init__(self, model_path=None, device='mps'):
+        """Initialize the Gemma engine.
+        
+        Args:
+            model_path: Path to the model weights directory
+            device: Device to run inference on ('cpu', 'cuda', 'mps')
+        """
         self.model_path = model_path
+        self.device = device if torch.backends.mps.is_available() and device == 'mps' else 'cpu'
         self.model = None
         self.processor = None
+        # Track if we need to use CPU for vision processing (Apple Silicon compatibility)
+        self.use_cpu_for_vision = False
         self.mission = ""
 
         logger.info(f"🧠 [GemmaEngine] Initializing from path: {model_path}")
@@ -138,35 +146,41 @@ class GemmaEngine:
             # Create model inputs (all tensors should be on CPU at this point for the processor)
             inputs = self.processor(**processor_inputs).to(self.device)
             
+            # Handle vision processing compatibility for Apple Silicon
+            # If we've encountered the attention head mismatch before, process vision on CPU
+            if self.use_cpu_for_vision and "pixel_values" in inputs:
+                logger.debug("Using CPU for vision processing due to previous attention head mismatch")
+                # Move only the pixel_values to CPU
+                for k in inputs.keys():
+                    if k == "pixel_values":
+                        inputs[k] = inputs[k].cpu()
+            
+            # Use only supported generation parameters for Gemma 3n
             try:
                 # Generate text with correct Gemma parameters
                 generation = self.model.generate(
                     **inputs,
                     max_new_tokens=256,  # Use max_new_tokens instead of max_length
-                    do_sample=False,
-                    temperature=0.7,  # Standard temperature
-                    repetition_penalty=1.1  # Prevent repetition
+                    do_sample=False,  # Use greedy decoding
                 )
             except RuntimeError as e:
-                if "number of heads in query/key/value should match" in str(e):
-                    logger.warning("Detected attention head mismatch. Attempting fallback to CPU processing for vision component...")
+                error_msg = str(e)
+                if "number of heads in query/key/value should match" in error_msg:
+                    logger.warning("Detected attention head mismatch in vision component on Apple Silicon. Switching to CPU for vision processing...")
+                    
+                    # Remember to use CPU for vision in future calls
+                    self.use_cpu_for_vision = True
+                    
                     # If we have an image, move it to CPU for processing
                     if "pixel_values" in inputs:
-                        # Create a copy of inputs without the problematic tensor
-                        cpu_inputs = {}
-                        for k, v in inputs.items():
-                            if k == "pixel_values":
-                                # Process only this tensor on CPU
-                                cpu_inputs[k] = v.cpu()
-                            else:
-                                cpu_inputs[k] = v
+                        # Move only the pixel_values tensor to CPU
+                        inputs["pixel_values"] = inputs["pixel_values"].cpu()
                         
+                        # Try again with pixel_values on CPU
                         generation = self.model.generate(
-                            **cpu_inputs,
+                            **inputs,
                             max_new_tokens=256,
-                            do_sample=False,
-                            temperature=0.7,
-                            repetition_penalty=1.1
+                            do_sample=False
                         )
                     else:
                         # Re-raise if we can't handle this case

@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name="sentience",
-    version="0.2.0",
+    version="0.1.0",
     author="Cascade AI",
     description="A multimodal AI agent for real-time perception and action.",
     long_description=open('README.md').read(),
