@@ -14,7 +14,8 @@ import sys
 import time
 import numpy as np
 from torchvision.transforms.functional import to_pil_image
-from transformers import AutoProcessor, AutoModelForCausalLM, BitsAndBytesConfig
+from transformers import AutoProcessor, AutoModelForCausalLM, BitsAndBytesConfig, TextStreamer, TextIteratorStreamer
+import sys
 from PIL import Image
 from typing import Optional, Dict, Any, Union, Tuple
 
@@ -61,7 +62,7 @@ class GemmaEngine:
             # Load the model to CPU first to avoid direct-to-GPU allocation issues
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_path,
-                torch_dtype=torch.bfloat16,
+                torch_dtype=torch.float32 if self.device == "cpu" else torch.bfloat16,
                 low_cpu_mem_usage=True,  # Keep this for efficient loading into RAM
                 local_files_only=True
             )
@@ -71,6 +72,9 @@ class GemmaEngine:
             if self.device == "mps":
                 logger.info("Keeping entire model on CPU to avoid mixed-device deadlock")
                 self.model.to("cpu")
+                # Ensure weights are float32 to avoid dtype mismatch with Conv2d
+                if self.model.dtype != torch.float32:
+                    self.model = self.model.float()
                 self.device = "cpu"
             else:
                 self.model.to(self.device)
@@ -143,9 +147,13 @@ class GemmaEngine:
             
             # Process inputs based on available modalities
             # Prepare inputs
-            # Insert single placeholder image token that the processor will expand
-            image_placeholder = self.processor.image_token if hasattr(self.processor, "image_token") else "<image>"
-            prompt_with_token = f"{image_placeholder} {prompt}"
+            # Insert special placeholder tokens that the processor will expand
+            image_placeholder = getattr(self.processor, "image_token", "<image>")
+            if multimodal:
+                audio_placeholder = getattr(self.processor, "audio_token", "<audio>")
+                prompt_with_token = f"{image_placeholder} {audio_placeholder} {prompt}"
+            else:
+                prompt_with_token = f"{image_placeholder} {prompt}"
             
             processor_inputs = {
                 "text": prompt_with_token,
@@ -177,10 +185,12 @@ class GemmaEngine:
                         audio_cpu = audio_cpu.mean(axis=0)
                 # audio_cpu should now be shape [length]
                 
-                processor_inputs["audio"] = audio_cpu
+                # Gemma processor expects a list of 1-D arrays (batch dimension)
+                audio_examples = [audio_cpu.astype(np.float32)]
+                assert audio_examples[0].ndim == 1, "Audio must be 1-D mono"
+                processor_inputs["audio"] = audio_examples
                 processor_inputs["sampling_rate"] = audio_sampling_rate
-                # Update text field to include placeholder
-                processor_inputs["text"] = prompt_with_token
+
                 logger.debug(f"Processing with multimodal input (vision + audio), audio shape: {np.shape(audio_cpu)}")
 
             else:
@@ -206,14 +216,68 @@ class GemmaEngine:
             )
             
             # Use only supported generation parameters for Gemma 3n
-            logger.debug("Calling model.generate ...")
+            # Set up a custom streamer that shows tokens with real-time logging
+            class CustomStreamer(TextIteratorStreamer):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self.tokens_generated = 0
+                
+                def on_finalized_text(self, text, stream_end=False):
+                    super().on_finalized_text(text, stream_end)
+                    self.tokens_generated += 1
+                    # Print directly to stdout (bypassing logging) so it's immediately visible
+                    # Add a special marker so it stands out in the logs
+                    sys.stdout.write(f"\n💬 TOKEN: {text}\n")
+                    sys.stdout.flush()
+                    if stream_end:
+                        sys.stdout.write("\n[END OF STREAM]\n")
+                        sys.stdout.flush()
+            
+            streamer = CustomStreamer(
+                self.processor.tokenizer, 
+                skip_prompt=True, 
+                skip_special_tokens=True,
+                timeout=120.0  # Increase timeout to accommodate slow first token
+            )
+            logger.info("🌀 Starting model.generate with streaming... [first token may take several minutes]")
             try:
                 # Generate text with correct Gemma parameters
+                # Log precise timing for the generation call to monitor progress
+                gen_start = time.time()
+                logger.debug(f"Generation starting at {time.strftime('%H:%M:%S')}")
+                
+                import threading
+                # Use an event to signal when generation is complete
+                generation_complete = threading.Event()
+                
+                # Create a separate thread to monitor generation progress
+                def log_progress():
+                    elapsed = 0
+                    while elapsed < 600 and not generation_complete.is_set():  # Stop when complete or timeout
+                        time.sleep(5)  # Check more frequently but only log every 30s
+                        if generation_complete.is_set():
+                            break
+                            
+                        elapsed = time.time() - gen_start
+                        if elapsed >= 30 and elapsed % 30 < 5:  # Log at 30s intervals
+                            logger.info(f"⏳ Still waiting for first token... {elapsed:.1f} seconds elapsed")
+                
+                # Start progress monitoring in background thread
+                progress_thread = threading.Thread(target=log_progress, daemon=True)
+                progress_thread.start()
+                
+                # Try with a smaller max_new_tokens first for faster initial response
                 generation = self.model.generate(
                     **inputs,
-                    max_new_tokens=64,  # Start with fewer tokens for faster first response
-                    do_sample=False,  # Use greedy decoding
+                    max_new_tokens=16,  # Very short response for first run
+                    do_sample=False,    # Greedy decoding for deterministic, faster output
+                    streamer=streamer,  # Stream tokens to stdout for live progress
+                    temperature=0.0     # Zero temperature for fastest possible response
                 )
+                
+                # Signal that generation is complete to stop the progress thread
+                generation_complete.set()
+                logger.info(f"✓ First generation completed in {time.time() - gen_start:.1f}s")
             except RuntimeError as e:
                 error_msg = str(e)
                 if "number of heads in query/key/value should match" in error_msg:
@@ -227,29 +291,101 @@ class GemmaEngine:
                     # Move inputs to CPU
                     inputs = inputs.to('cpu')
                     
-                    # Try again with everything on CPU
-                    logger.debug("Retrying generate with all inputs on CPU...")
+                    # Try again with everything on CPU, but still use streaming
+                    logger.info("Retrying generate with all inputs on CPU and streaming...")
+                    
+                    # Create a fresh streamer for the retry path
+                    retry_streamer = CustomStreamer(
+                        self.processor.tokenizer, 
+                        skip_prompt=True, 
+                        skip_special_tokens=True,
+                        timeout=120.0
+                    )
+                    
+                    # Log precise timing for the retry generation call
+                    gen_start = time.time()
+                    logger.debug(f"CPU retry generation starting at {time.strftime('%H:%M:%S')}")
+                    
+                    # Create new progress tracker for CPU path
+                    cpu_generation_complete = threading.Event()
+                    
+                    def cpu_log_progress():
+                        elapsed = 0
+                        while elapsed < 600 and not cpu_generation_complete.is_set():
+                            time.sleep(5)
+                            if cpu_generation_complete.is_set():
+                                break
+                                
+                            elapsed = time.time() - gen_start
+                            if elapsed >= 30 and elapsed % 30 < 5:  # Log at 30s intervals
+                                logger.info(f"⏳ [CPU] Still waiting for first token... {elapsed:.1f} seconds elapsed")
+                    
+                    # Start CPU progress monitoring thread
+                    cpu_progress_thread = threading.Thread(target=cpu_log_progress, daemon=True)
+                    cpu_progress_thread.start()
+                    
+                    # Stream tokens in the retry path too
                     generation = self.model.generate(
                         **inputs,
-                        max_new_tokens=64,  # Start with fewer tokens for faster first response
-                        do_sample=False     # Use greedy decoding
+                        max_new_tokens=16,  # Very short response for first run
+                        do_sample=False,    # Greedy decoding
+                        streamer=retry_streamer,  # Use new streamer
+                        temperature=0.0     # Zero temperature for fastest possible response
                     )
+                    
+                    # Stop the CPU progress thread
+                    cpu_generation_complete.set()
+                    # Signal that generation is complete if we used the progress thread here too
+                    if 'generation_complete' in locals():
+                        generation_complete.set()
+                    logger.info(f"✓ CPU retry generation completed in {time.time() - gen_start:.1f}s")
                 else:
                     # Re-raise for other errors
                     raise
+            # Log token count metrics
+            input_length = len(inputs['input_ids'][0])
+            output_length = len(generation[0])
+            new_tokens = output_length - input_length
+            logger.info(f"Generation produced {new_tokens} new tokens (from {input_length} input tokens)")
+
+            # Decode final result from the full generation
             result = self.processor.decode(generation[0], skip_special_tokens=True)
             
             # Extract description (remove prompt)
             description = result[len(prompt):].strip()
             
             inference_time = time.time() - start_time
-            logger.debug(f"Scene description inference: {inference_time*1000:.1f}ms")
+            logger.info(f"Scene description inference: {inference_time*1000:.1f}ms")
             
             return description
         except Exception as e:
             logger.error(f"Error during scene description: {e}", exc_info=True)
             return "[Inference Error: Unable to describe scene]"
 
+    def _log_model_info(self):
+        """Log detailed model information for debugging"""
+        try:
+            # Log important model configuration details for debugging
+            if hasattr(self.model.config, 'torch_dtype'):
+                logger.debug(f"Model config torch_dtype: {self.model.config.torch_dtype}")
+            
+            # Log device placement
+            if hasattr(self.model, 'device'):
+                logger.debug(f"Model device: {self.model.device}")
+            else:
+                # Check device of first parameter
+                for param in self.model.parameters():
+                    logger.debug(f"First model parameter on device: {param.device}")
+                    break
+            
+            # Log attention mechanism used
+            if hasattr(self.model, 'config') and hasattr(self.model.config, 'text_config'):
+                if hasattr(self.model.config.text_config, 'layer_types'):
+                    layer_types = self.model.config.text_config.layer_types
+                    logger.debug(f"Layer types: {layer_types[:3]}...{layer_types[-3:]} (showing first/last 3)")
+        except Exception as e:
+            logger.debug(f"Error logging model info: {e}")
+    
     def plan_action(self, scene_description: str) -> str:
         """Given a scene description, suggests a concise, command-like next action.
         
