@@ -310,7 +310,8 @@ class GemmaEngine:
                     # Convert CHW -> HWC PIL image
                     image = to_pil_image(image.cpu())
                 image = image.convert("RGB")
-                image = image.resize((224, 224))
+                target = self.processor.image_processor.size["shortest_edge"]
+                image = image.resize((target, target))
             
             # Process inputs based on available modalities
             # Prepare inputs
@@ -376,7 +377,12 @@ class GemmaEngine:
                     # Manual pipeline to bypass model.generate() device mismatch
                     # a) vision & audio towers on CPU
                     pixel_values = inputs['pixel_values']
-                    v_tok = self.model.model.vision_tower(pixel_values).last_hidden_state
+                    with torch.no_grad():
+                        feats = self.model.model.vision_tower.forward_features(pixel_values)   # shape (B, N, C)
+                        if isinstance(feats, (list, tuple)):
+                            v_tok = feats[-1]          # take the last stage tokens
+                        else:
+                            v_tok = feats              # already the token tensor
                     
                     a_tok = None
                     if multimodal and 'input_features' in inputs:
@@ -490,7 +496,12 @@ class GemmaEngine:
                     # Normal mode - use same manual pipeline
                     # a) vision & audio towers on CPU
                     pixel_values = inputs['pixel_values']
-                    v_tok = self.model.model.vision_tower(pixel_values).last_hidden_state
+                    with torch.no_grad():
+                        feats = self.model.model.vision_tower.forward_features(pixel_values)   # shape (B, N, C)
+                        if isinstance(feats, (list, tuple)):
+                            v_tok = feats[-1]          # take the last stage tokens
+                        else:
+                            v_tok = feats              # already the token tensor
                     
                     a_tok = None
                     if multimodal and 'input_features' in inputs:
@@ -720,7 +731,8 @@ class GemmaEngine:
             start_time = time.time()
             
             # This is a text-only prompt, so no image is passed
-            inputs = self.processor(text=prompt, images=None, return_tensors="pt").to(self.device)
+            inputs = self.processor(text=prompt, images=None, return_tensors="pt")
+            inputs = inputs.to("cpu")          # keep everything on the CPU model
             
             # Generate text
             generation = self.model.generate(
