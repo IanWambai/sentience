@@ -8,6 +8,7 @@ a true multimodal fashion with shared context window and attention.
 """
 
 import os
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
 import torch
 import logging
 import sys
@@ -91,9 +92,7 @@ class GemmaEngine:
             sys.exit(1)
 
         try:
-            # EXPLICITLY DISABLE MPS fallback - the E2B model should be fully compatible with 256-dim heads
-            import os
-            os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
+            # MPS fallback already disabled globally at module import
             
             logger.info("Loading Gemma 3n-E2B model weights into system RAM first...")
             # Configure quantization options based on available imports
@@ -120,26 +119,19 @@ class GemmaEngine:
             # Setup hybrid execution strategy for Apple Silicon
             if self.device == "mps":
                 try:
-                    # Ensure model is in float16 for MPS compatibility and speed
-                    if self.model.dtype != torch.float16:
-                        self.model = self.model.half()
-                    
-                    # Start with everything on CPU
-                    self.model.to("cpu")
+                    # Keep model on CPU - avoid unnecessary transfers
                     
                     # SELECTIVE DEVICE PLACEMENT STRATEGY:
                     logger.info("⚙️ Implementing hybrid CPU/MPS execution strategy")
                     
-                    # 1. Keep vision tower on CPU (MPS incompatible with 512-dim attention)
+                    # 1. Vision tower stays on CPU (MPS incompatible with 512-dim attention)
                     self.vision_cpu = True
-                    if hasattr(self.model, "vision_tower"):
-                        logger.info("📷 Keeping vision tower on CPU for compatibility")
-                        self.model.vision_tower.to("cpu")
+                    if hasattr(self.model.model, "vision_tower"):
+                        logger.info("👁️ Vision tower will run on CPU for compatibility")
                     
-                    # 2. Keep audio tower on CPU (same attention incompatibilities)
-                    if hasattr(self.model, "audio_tower"):
-                        logger.info("🎤 Keeping audio tower on CPU for compatibility")
-                        self.model.audio_tower.to("cpu")
+                    # 2. Audio tower stays on CPU (same attention incompatibilities)
+                    if hasattr(self.model.model, "audio_tower"):
+                        logger.info("🎤 Audio tower will run on CPU for compatibility")
                     
                     # 3. Move language model component to MPS - CORRECT PATH: model.model.language_model
                     #    For Gemma3nForConditionalGeneration this is the actual decoder path
@@ -154,24 +146,13 @@ class GemmaEngine:
                         
                         # Explicitly ensure vision and audio towers stay on CPU first
                         try:
-                            # Move the whole model to CPU first to ensure clean state
-                            self.model = self.model.to("cpu")
+                            # Vision and audio towers stay on CPU by default - no moves needed
                             
-                            # Make sure vision tower and all its submodules are explicitly on CPU
-                            if hasattr(self.model.model.model, 'vision_tower'):
-                                self.model.model.model.vision_tower = self.model.model.model.vision_tower.to("cpu")
-                                logger.info("✅ Explicitly placed vision tower on CPU")
-                            
-                            # Make sure audio tower and all its submodules are explicitly on CPU
-                            if hasattr(self.model.model.model, 'audio_tower'):
-                                self.model.model.model.audio_tower = self.model.model.model.audio_tower.to("cpu")
-                                logger.info("✅ Explicitly placed audio tower on CPU")
-                            
-                            # Now move only the language model to MPS
-                            # Note: model.model.language_model is the path to the actual LM in Gemma 3n
-                            self.model.model.model.language_model = self.model.model.model.language_model.to(
-                                'mps', dtype=torch.float16)
-                            logger.info("✅ Successfully moved language model to MPS with float16 precision")
+                            # Store separate language model handle on MPS
+                            lm = self.model.model.language_model.to('mps', dtype=torch.float16)
+                            self.lm = lm
+                            self.language_device = "mps"
+                            logger.info("✅ Language model moved to MPS with separate handle")
                         except Exception as e:
                             logger.error(f"Error during hybrid device placement: {e}")
                             logger.warning("Falling back to full CPU execution")
@@ -192,7 +173,6 @@ class GemmaEngine:
             else:
                 # Standard CPU path
                 self.model.to(self.device)
-                self.vision_cpu = False
                 
             logger.info(f"✓ Model configuration complete. Using: CPU for vision/audio, {self.device} for language processing.")
             # Remove unsupported default generation params cleanly to silence warnings
@@ -287,33 +267,8 @@ class GemmaEngine:
                 return_tensors="pt"
             )
             
-            # Always ensure tensors start on CPU for vision/audio processing
+            # Keep all tensors on CPU - manual pipeline will handle transfers
             inputs = {k: v.to('cpu') if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
-            
-            # If we're in hybrid execution mode, the language model is on MPS
-            # Need to transfer processed embeddings to MPS exactly once per frame
-            if self.hybrid_execution and self.device == "mps":
-                transfer_start = time.time()
-                
-                # Move only specific tensors to MPS, keeping vision_input_ids and audio_input_ids on CPU
-                # This is critical for hybrid execution where vision/audio towers must stay on CPU
-                input_keys = list(inputs.keys())
-                for k in input_keys:
-                    if isinstance(inputs[k], torch.Tensor):
-                        # Keep these specific tensor types on CPU for proper vision/audio tower execution
-                        if k in ['vision_input_ids', 'audio_input_ids']:
-                            logger.debug(f"Keeping {k} on CPU for tower processing")
-                            continue
-                            
-                        tensor_size_mb = inputs[k].element_size() * inputs[k].numel() / (1024 * 1024)
-                        before_transfer = time.time()
-                        inputs[k] = inputs[k].to("mps")
-                        transfer_time = (time.time() - before_transfer) * 1000
-                        logger.debug(f"Tensor {k} ({tensor_size_mb:.2f}MB) → MPS: {transfer_time:.2f}ms")
-                
-                # Log total transfer time - should be <0.3ms as specified in requirements
-                total_transfer_ms = (time.time() - transfer_start) * 1000
-                logger.debug(f"Total CPU → MPS tensor transfer: {total_transfer_ms:.2f}ms")
             
             return inputs
         except Exception as e:
@@ -368,6 +323,12 @@ class GemmaEngine:
                 prompt_with_token = f"{image_placeholder} {prompt}"
             
             inputs = self._process_inputs(image, audio, prompt_with_token)
+            
+            # Guard against KeyError when audio placeholder is set but no input_features
+            if multimodal and 'input_features' not in inputs:
+                multimodal = False
+                logger.debug("Audio placeholder set but no input_features - disabling multimodal")
+            
             logger.debug("Prompt with placeholder token: %s", prompt_with_token)
             logger.debug("Using prompt with image token: %s", prompt[:50] + "...")
 
@@ -412,12 +373,35 @@ class GemmaEngine:
                 # Subsequent runs use better settings for quality results
                 if first_run:
                     logger.info("🔥 First generation - using ultra minimal settings for fastest warmup")
-                    generation = self.model.generate(
-                        **inputs,
-                        max_new_tokens=8,     # Absolute minimum tokens - just need to complete first compile
-                        do_sample=False,      # Greedy
-                        streamer=streamer     # Stream tokens
-                    )
+                    # Manual pipeline to bypass model.generate() device mismatch
+                    # a) vision & audio towers on CPU
+                    pixel_values = inputs['pixel_values']
+                    v_tok = self.model.model.vision_tower(pixel_values).last_hidden_state
+                    
+                    a_tok = None
+                    if multimodal and 'input_features' in inputs:
+                        mels = inputs['input_features']
+                        a_tok = self.model.model.audio_tower(mels).last_hidden_state
+                    
+                    # b) move tokens to GPU
+                    v_tok = v_tok.to("mps", dtype=torch.float16, non_blocking=True)
+                    if a_tok is not None:
+                        a_tok = a_tok.to("mps", dtype=torch.float16, non_blocking=True)
+                    
+                    # c) build text prefix on GPU (with modality tokens)
+                    text_ids = self.processor(text=prompt_with_token, return_tensors="pt").input_ids.to("mps")
+                    t_tok = self.lm.embed_tokens(text_ids)
+                    
+                    # d) concatenate embeddings
+                    if a_tok is not None:
+                        inp = torch.cat([v_tok, a_tok, t_tok], dim=1)
+                    else:
+                        inp = torch.cat([v_tok, t_tok], dim=1)
+                    
+                    # e) direct language model call
+                    out = self.lm(inputs_embeds=inp, use_cache=True)
+                    logits = out.logits[:, -1, :]
+                    generation = logits.argmax(-1).unsqueeze(0).unsqueeze(0)
                     # Mark that we've completed first generation
                     self._first_generation_complete = True
                     
@@ -466,27 +450,94 @@ class GemmaEngine:
                         streamer.on_finalized_text = log_and_stream
                         streamer.token_seen = True
                     
-                    # Use a more moderate token count for efficiency while still getting good descriptions
-                    # Reuse the same inputs but with different generation settings
-                    generation = self.model.generate(
-                        **inputs,  # Reuse the same inputs for efficiency
-                        max_new_tokens=128,  # Balanced token count for good descriptions without excess
-                        do_sample=True,      # Enable sampling for better quality
-                        temperature=0.7,     # Good balance for creativity vs coherence
-                        top_k=40,           
-                        top_p=0.9,          
-                        streamer=streamer    # Reuse the existing streamer with our logging wrapper
-                    )
+                    # Second generation with optimized autoregressive loop
+                    generated_ids = []
+                    
+                    # Process full prefix once to get past_key_values
+                    out = self.lm(inputs_embeds=inp, use_cache=True)
+                    past = out.past_key_values
+                    next_id = out.logits[:, -1, :].argmax(-1)
+                    generated_ids.append(next_id.item())
+                    
+                    # Stream first token
+                    token_text = self.processor.tokenizer.decode([next_id.item()], skip_special_tokens=True)
+                    if token_text.strip():
+                        streamer.on_finalized_text(token_text)
+                    
+                    # Check EOS on first token
+                    if next_id.item() != self.processor.tokenizer.eos_token_id:
+                        # Continue with single-token steps (O(1) each)
+                        for _ in range(127):  # Already generated 1 token
+                            # Single token input for subsequent steps
+                            next_emb = self.lm.embed_tokens(next_id.unsqueeze(0))
+                            out = self.lm(inputs_embeds=next_emb, past_key_values=past, use_cache=True)
+                            
+                            past = out.past_key_values
+                            next_id = out.logits[:, -1, :].argmax(-1)
+                            generated_ids.append(next_id.item())
+                            
+                            # Stream token
+                            token_text = self.processor.tokenizer.decode([next_id.item()], skip_special_tokens=True)
+                            if token_text.strip():
+                                streamer.on_finalized_text(token_text)
+                            
+                            # Check EOS
+                            if next_id.item() == self.processor.tokenizer.eos_token_id:
+                                break
+                    
+                    generation = generated_ids  # Save token IDs for decoding
                 else:
-                    # Normal mode - model is already warmed up
-                    generation = self.model.generate(
-                        **inputs,
-                        max_new_tokens=64,    # Full response
-                        do_sample=True,       # Enable sampling for better quality
-                        top_k=40,             # Reasonable sampling parameters
-                        top_p=0.9,
-                        streamer=streamer      # Stream tokens
-                    )
+                    # Normal mode - use same manual pipeline
+                    # a) vision & audio towers on CPU
+                    pixel_values = inputs['pixel_values']
+                    v_tok = self.model.model.vision_tower(pixel_values).last_hidden_state
+                    
+                    a_tok = None
+                    if multimodal and 'input_features' in inputs:
+                        mels = inputs['input_features']
+                        a_tok = self.model.model.audio_tower(mels).last_hidden_state
+                    
+                    # b) move tokens to GPU
+                    v_tok = v_tok.to("mps", dtype=torch.float16, non_blocking=True)
+                    if a_tok is not None:
+                        a_tok = a_tok.to("mps", dtype=torch.float16, non_blocking=True)
+                    
+                    # c) build text prefix on GPU (with modality tokens)
+                    text_ids = self.processor(text=prompt_with_token, return_tensors="pt").input_ids.to("mps")
+                    t_tok = self.lm.embed_tokens(text_ids)
+                    
+                    # d) concatenate and generate with proper token loop
+                    if a_tok is not None:
+                        inp = torch.cat([v_tok, a_tok, t_tok], dim=1)
+                    else:
+                        inp = torch.cat([v_tok, t_tok], dim=1)
+                    
+                    # Generate tokens with optimized loop
+                    generated_ids = []
+                    
+                    # Process full prefix once to get past_key_values
+                    out = self.lm(inputs_embeds=inp, use_cache=True)
+                    past = out.past_key_values
+                    next_id = out.logits[:, -1, :].argmax(-1)
+                    generated_ids.append(next_id.item())
+                    
+                    # Check EOS on first token
+                    if next_id.item() != self.processor.tokenizer.eos_token_id:
+                        # Continue with single-token steps (O(1) each)
+                        for _ in range(63):  # Already generated 1 token, need 63 more for 64 total
+                            # Single token input for subsequent steps
+                            next_emb = self.lm.embed_tokens(next_id.unsqueeze(0))
+                            out = self.lm(inputs_embeds=next_emb, past_key_values=past, use_cache=True)
+                            
+                            past = out.past_key_values
+                            next_id = out.logits[:, -1, :].argmax(-1)
+                            generated_ids.append(next_id.item())
+                            
+                            # Check EOS
+                            if next_id.item() == self.processor.tokenizer.eos_token_id:
+                                break
+                    
+                    generation = generated_ids
                 
                 # Signal that generation is complete to stop all progress threads
                 if 'generation_complete' in locals():
@@ -494,9 +545,9 @@ class GemmaEngine:
                 if 'generation_complete_phase2' in locals():
                     generation_complete_phase2.set()
                 if 'progress_thread' in locals():
-                    progress_thread.join(timeout=1)
+                    progress_thread.join()
                 if 'progress_thread_phase2' in locals():
-                    progress_thread_phase2.join(timeout=1)
+                    progress_thread_phase2.join()
                 logger.info(f"✓ First generation completed in {time.time() - gen_start:.1f}s")
             except RuntimeError as e:
                 error_msg = str(e)
@@ -507,9 +558,6 @@ class GemmaEngine:
                     # since we can't separately handle pixel_values
                     self.model = self.model.to('cpu')
                     self.device = 'cpu'
-                    
-                    # Move inputs to CPU
-                    inputs = inputs.to('cpu')
                     
                     # Try again with everything on CPU, but still use streaming
                     logger.info("Retrying generate with all inputs on CPU and streaming...")
@@ -530,6 +578,7 @@ class GemmaEngine:
                     
                     def cpu_log_progress():
                         elapsed = 0
+                        msg_prefix = "first token" if first_run else "generation"
                         while elapsed < 600 and not cpu_generation_complete.is_set():
                             time.sleep(5)
                             if cpu_generation_complete.is_set():
@@ -543,10 +592,13 @@ class GemmaEngine:
                     cpu_progress_thread = threading.Thread(target=cpu_log_progress, daemon=True)
                     cpu_progress_thread.start()
                     
-                    # CPU retry - use appropriate strategy based on first run status
+                    # CPU retry - use text-only to avoid multimodal device mismatch
+                    # Create text-only inputs to avoid vision/audio device conflicts
+                    text_only_inputs = self.processor(text=prompt, return_tensors="pt").to('cpu')
+                    
                     if first_run:
                         generation = self.model.generate(
-                            **inputs,
+                            **text_only_inputs,
                             max_new_tokens=8,     # Minimal tokens for warmup
                             do_sample=False,      # Greedy
                             streamer=retry_streamer
@@ -557,7 +609,7 @@ class GemmaEngine:
                         # Now immediately do a second generation with better settings
                         logger.info("🚀 Initial CPU warmup complete - now generating full response...")
                         generation = self.model.generate(
-                            **inputs,
+                            **text_only_inputs,
                             max_new_tokens=64,    # Full response
                             do_sample=True,       # Better quality
                             top_k=40,
@@ -567,7 +619,7 @@ class GemmaEngine:
                     else:
                         # Normal mode for subsequent generations
                         generation = self.model.generate(
-                            **inputs,
+                            **text_only_inputs,
                             max_new_tokens=64,    # Full response
                             do_sample=True,       # Better quality
                             top_k=40,
@@ -589,21 +641,30 @@ class GemmaEngine:
 
             # Log token count metrics before decoding
             input_length = len(inputs['input_ids'][0])
-            output_length = len(generation[0])
-            new_tokens = output_length - input_length
-            logger.info(f"Generation produced {new_tokens} new tokens (from {input_length} input tokens)")
             
-            # Decode final result from the full generation
-            result = self.processor.decode(generation[0], skip_special_tokens=True)
-            
-            # For phase 2, we need to extract content after the enhanced prompt
-            if 'prompt_phase2' in locals():
-                # Extract description (remove enhanced prompt)
-                # Try to find a reasonable position after the prompt
-                base_prompt_len = len(prompt)
-                description = result[base_prompt_len:].strip()
+            # Handle both list and tensor formats
+            if isinstance(generation, list):
+                # Manual generation returns list of token IDs
+                new_tokens = len(generation)
+                output_length = input_length + new_tokens  # Total tokens for consistency
+                decode_input = generation
             else:
-                # Regular generation - extract after original prompt
+                # CPU fallback returns tensor
+                output_length = len(generation[0])
+                new_tokens = output_length - input_length
+                decode_input = generation[0]
+            
+            logger.info(f"Generation produced {new_tokens} new tokens (from {input_length} input tokens, total {output_length})")
+            
+            # Decode final result
+            result = self.processor.tokenizer.decode(decode_input, skip_special_tokens=True)
+            
+            # Since we decode only generated tokens, result is already the description
+            if isinstance(generation, list):
+                # Manual generation - result is already clean generated text
+                description = result.strip()
+            else:
+                # CPU fallback - need to extract after original prompt
                 description = result[len(prompt):].strip()
             
             inference_time = time.time() - start_time
