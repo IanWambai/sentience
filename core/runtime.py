@@ -74,6 +74,7 @@ def run(test_mode=False, enable_audio=True):
     Initializes the system and runs the continuous perception-inference loop.
     """
     print("\nSentience Cognition Engine initializing...")
+    print("🎭 Demo mode enabled - will show simulated responses if model inference fails")
     start_time = time.time()
     
     # Initialize system
@@ -172,6 +173,10 @@ def run(test_mode=False, enable_audio=True):
                 
                 # 4. Emit thought
                 thought_sink.emit(scene_text, plan_text)
+                
+                # Check if we're in demo mode and log it once
+                if iteration_count == 1 and ("[DEMO]" in scene_text or "[Simulated]" in scene_text or "[Demo Mode]" in scene_text):
+                    print("🎭 Demo mode active - showing simulated AI responses")
 
             except Exception as e:
                 logger.error(f"An error occurred in the main loop: {e}", exc_info=True)
