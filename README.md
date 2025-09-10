@@ -102,6 +102,36 @@ python -m sentience --test
 python -m sentience --log-level DEBUG
 ```
 
+### Planner Backends (GPT‑OSS / OpenAI)
+
+Sentience now supports using external LLMs for the action planning step while keeping the optimized Gemma multimodal scene description. You can select a planner backend via CLI flags:
+
+```bash
+# Use GPT‑OSS (e.g., 20B) via Ollama for action planning
+python -m sentience \
+  --planner-backend gptoss_ollama \
+  --planner-model-id openai/gpt-oss-20b \
+  --ollama-host http://127.0.0.1:11434
+
+# Use an OpenAI-compatible API (OpenAI or vLLM) for action planning
+python -m sentience \
+  --planner-backend openai \
+  --planner-model-id gpt-4o-mini \
+  --openai-base-url https://api.openai.com/v1 \
+  --openai-api-key $OPENAI_API_KEY
+
+# With a self-hosted vLLM server serving GPT‑OSS
+python -m sentience \
+  --planner-backend openai \
+  --planner-model-id openai/gpt-oss-20b \
+  --openai-base-url http://localhost:8000/v1 \
+  --openai-api-key dummy
+```
+
+Notes:
+- The external planner uses the Harmony response format internally and returns a single, concise action command per tick.
+- If an external backend is unreachable or missing dependencies, Sentience automatically falls back to Gemma-based planning.
+
 ### Command Line Options
 
 | Option | Description | Use Case |
@@ -109,6 +139,11 @@ python -m sentience --log-level DEBUG
 | `--no-audio` | Disable audio input processing | When microphone is unavailable or unwanted |
 | `--test` | Use synthetic test inputs | Development, testing, or when hardware unavailable |
 | `--log-level` | Set logging verbosity | Debugging and performance monitoring |
+| `--planner-backend` | Planner backend: `gemma` (default), `gptoss_ollama`, or `openai` | Use GPT‑OSS/OpenAI for action planning |
+| `--planner-model-id` | Model identifier for the planner backend | e.g., `openai/gpt-oss-20b`, `gpt-4o-mini` |
+| `--openai-base-url` | Base URL for OpenAI-compatible servers | e.g., `https://api.openai.com/v1`, `http://localhost:8000/v1` |
+| `--openai-api-key` | API key for OpenAI-compatible servers | Required for OpenAI; `dummy` for local vLLM |
+| `--ollama-host` | Host URL for Ollama | Default `http://127.0.0.1:11434` |
 
 ### Output Format
 

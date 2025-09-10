@@ -5,6 +5,18 @@ This module provides the GemmaEngine class, which encapsulates all logic for
 loading the model, processing inputs, and generating outputs for scene
 description and action planning. Processes both visual and audio inputs in
 a true multimodal fashion with shared context window and attention.
+
+Enhancement: Optional planner backends (gpt-oss via Ollama, or OpenAI API)
+--------------------------------------------------------------------------
+In addition to the default Gemma-based planner, the engine can now use an
+external LLM for the action planning step while keeping Gemma for multimodal
+scene description. Supported planner backends:
+  - "gemma" (default): use local Gemma model (existing behavior)
+  - "gptoss_ollama": use an Ollama-served GPT-OSS model via HTTP
+  - "openai": use OpenAI-compatible chat completions API
+
+This allows minimal changes to qualify for hackathons requiring gpt-oss use
+without replacing the multimodal path.
 """
 
 import os
@@ -19,6 +31,18 @@ from PIL import Image, ImageDraw, ImageFont
 from torchvision.transforms import ToPILImage
 from transformers import AutoProcessor, AutoModelForCausalLM, TextStreamer
 import numpy as np
+
+# Optional dependencies for planner backends
+try:
+    import requests  # for Ollama HTTP
+except Exception:  # pragma: no cover
+    requests = None
+
+try:
+    # OpenAI client v1 style; also works with OpenAI-compatible base_url (e.g., vLLM)
+    from openai import OpenAI  # type: ignore
+except Exception:  # pragma: no cover
+    OpenAI = None
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -64,13 +88,24 @@ class GemmaEngine:
     Note: To upgrade to E4B when PyTorch adds 512-dim support in a future release,
     update the model path and verify with torch.backends.mps.sdpa_supports(head_dim=512)
     """
-    def __init__(self, model_path=None, device='mps'):
+    def __init__(self, model_path=None, device='mps',
+                 planner_backend: str = "gemma",
+                 planner_model_id: Optional[str] = None,
+                 openai_base_url: Optional[str] = None,
+                 openai_api_key: Optional[str] = None,
+                 ollama_host: str = "http://127.0.0.1:11434"):
         """
         Initialize the Gemma engine.
         
         Args:
             model_path: Path to the model weights directory
             device: Device to run inference on ('cpu', 'cuda', 'mps')
+            planner_backend: Which backend to use for plan_action. One of
+                {'gemma','gptoss_ollama','openai'}
+            planner_model_id: Model ID/name for external planner backends
+            openai_base_url: Optional base URL for OpenAI-compatible servers
+            openai_api_key: API key for OpenAI-compatible servers (if needed)
+            ollama_host: Host for Ollama HTTP API
         """
         self.model_path = model_path
         # Check for MPS availability and use it if available
@@ -84,11 +119,45 @@ class GemmaEngine:
         self.hybrid_execution = False
         self.mission = ""
 
+        # Planner backend configuration
+        self.planner_backend = planner_backend
+        self.planner_model_id = planner_model_id or os.environ.get("SENTIENCE_PLANNER_MODEL", "openai/gpt-oss-20b")
+        self.openai_base_url = openai_base_url or os.environ.get("OPENAI_BASE_URL")
+        self.openai_api_key = openai_api_key or os.environ.get("OPENAI_API_KEY")
+        self.ollama_host = ollama_host or os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
+        self._planner_client = None
+
         logger.info(f"🧠 [GemmaEngine] Initializing from path: {model_path}")
         logger.info(f"🧠 [GemmaEngine] Using device: {self.device} (MPS available: {torch.backends.mps.is_available()})")
         self._load_model_and_processor()
         self._load_mission_prompt()
+        self._init_planner_backend()
         logger.info("🧠 [GemmaEngine] Initialization complete.")
+
+    def _init_planner_backend(self):
+        """Initialise optional planner backend clients."""
+        try:
+            if self.planner_backend == "gptoss_ollama":
+                if requests is None:
+                    logger.warning("requests not installed; falling back to Gemma planner")
+                    self.planner_backend = "gemma"
+                    return
+                # No persistent client needed; validate host reachability lazily
+                logger.info(f"🧩 Planner backend: GPT-OSS via Ollama at {self.ollama_host}")
+            elif self.planner_backend == "openai":
+                if OpenAI is None:
+                    logger.warning("openai client not installed; falling back to Gemma planner")
+                    self.planner_backend = "gemma"
+                    return
+                base_url = self.openai_base_url or "https://api.openai.com/v1"
+                api_key = self.openai_api_key or os.environ.get("OPENAI_API_KEY") or ""
+                self._planner_client = OpenAI(base_url=base_url, api_key=api_key)
+                logger.info(f"🧩 Planner backend: OpenAI-compatible API at {base_url}, model={self.planner_model_id}")
+            else:
+                logger.info("🧩 Planner backend: Gemma (local)")
+        except Exception as e:
+            logger.warning(f"Planner backend init failed ({self.planner_backend}): {e}. Falling back to Gemma.")
+            self.planner_backend = "gemma"
 
     def _load_model_and_processor(self):
         """Loads the processor and model, with detailed error handling."""
@@ -723,6 +792,64 @@ class GemmaEngine:
         except Exception as e:
             logger.debug(f"Error logging model info: {e}")
     
+    def _harmony_system(self) -> str:
+        """Build Harmony system prompt from mission."""
+        # Minimal, explicit output contract
+        return (
+            "You are Sentience, an offline, continuous cognition engine running locally. "
+            "Given a scene description, reply with exactly one concise, imperative action command only. "
+            f"Mission: {self.mission}"
+        )
+
+    def _planner_generate_ollama(self, scene_description: str) -> Optional[str]:
+        if requests is None:
+            return None
+        try:
+            system_harmony = self._harmony_system()
+            prompt = (
+                "<|harmony|>\n" + system_harmony + "\n"
+                "<|user|>\n" + f"Given the scene: {scene_description}\nReturn only the action command." + "\n"
+                "<|assistant|>\n"
+            )
+            r = requests.post(
+                f"{self.ollama_host}/api/generate",
+                json={
+                    "model": self.planner_model_id,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {"num_predict": 96, "temperature": 0.2},
+                },
+                timeout=60,
+            )
+            r.raise_for_status()
+            action = (r.json().get("response") or "").strip()
+            return action or None
+        except Exception as e:
+            logger.debug(f"Ollama planner error: {e}")
+            return None
+
+    def _planner_generate_openai(self, scene_description: str) -> Optional[str]:
+        if self._planner_client is None:
+            return None
+        try:
+            system_harmony = self._harmony_system()
+            content = (
+                "<|harmony|>\n" + system_harmony + "\n"
+                "<|user|>\n" + f"Given the scene: {scene_description}\nReturn only the action command." + "\n"
+                "<|assistant|>\n"
+            )
+            resp = self._planner_client.chat.completions.create(
+                model=self.planner_model_id,
+                messages=[{"role": "user", "content": content}],
+                temperature=0.2,
+                max_tokens=96,
+            )
+            action = (resp.choices[0].message.content or "").strip()
+            return action or None
+        except Exception as e:
+            logger.debug(f"OpenAI planner error: {e}")
+            return None
+    
     def plan_action(self, scene_description: str) -> str:
         """Given a scene description, suggests a concise, command-like next action.
         
@@ -735,33 +862,40 @@ class GemmaEngine:
         Returns:
             str: Action recommendation as a concise command
         """
-        prompt = f'Mission: "{self.mission}"\n\nGiven the scene: "{scene_description}"\n\nRecommend one single, immediate, and concise action to take. Phrase it as a direct command. Your response must only be the action statement itself.'
+        # Try external planner backends first if configured
+        if self.planner_backend == "gptoss_ollama":
+            action = self._planner_generate_ollama(scene_description)
+            if action:
+                return action
+        elif self.planner_backend == "openai":
+            action = self._planner_generate_openai(scene_description)
+            if action:
+                return action
+
+        # Fallback to Gemma local planner
+        prompt = (
+            f'Mission: "{self.mission}"\n\n'
+            f'Given the scene: "{scene_description}"\n\n'
+            'Recommend one single, immediate, and concise action to take. '
+            'Phrase it as a direct command. Your response must only be the action statement itself.'
+        )
         if not self.model or not self.processor:
             logger.error("Model or processor not loaded. Cannot plan action.")
             return "[Initialization Error: Model not available]"
-            
+
         try:
             start_time = time.time()
-            
-            # This is a text-only prompt, so no image is passed
             inputs = self.processor(text=prompt, images=None, return_tensors="pt")
-            inputs = inputs.to("cpu")          # keep everything on the CPU model
-            
-            # Generate text
+            inputs = inputs.to("cpu")
             generation = self.model.generate(
-                **inputs, 
-                max_length=496, 
-                do_sample=False
+                **inputs,
+                max_length=496,
+                do_sample=False,
             )
-            
             result = self.processor.decode(generation[0], skip_special_tokens=True)
-            
-            # Extract just the action command from the result
             action = result[len(prompt):].strip().replace("Action: ", "")
-            
             inference_time = time.time() - start_time
             logger.debug(f"Action planning inference: {inference_time*1000:.1f}ms")
-            
             return action
         except Exception as e:
             logger.debug(f"Model inference failed, using demo mode: {e}")

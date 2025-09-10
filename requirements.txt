@@ -9,3 +9,7 @@ pyaudio>=0.2.13
 tqdm>=4.66.1
 torchvision>=0.18.0
 timm>=0.9.12
+
+# Optional backends for planner (GPT-OSS via Ollama / OpenAI API)
+requests>=2.31.0
+openai>=1.40.0

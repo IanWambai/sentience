@@ -67,7 +67,12 @@ class Initialiser:
         return mission
 
 
-def run(test_mode=False, enable_audio=True):
+def run(test_mode=False, enable_audio=True, *,
+        planner_backend: str = "gemma",
+        planner_model_id: str = None,
+        openai_base_url: str = None,
+        openai_api_key: str = None,
+        ollama_host: str = None):
     """
     Primary entry point for Sentience.
     
@@ -95,7 +100,15 @@ def run(test_mode=False, enable_audio=True):
     
     # Set up model engine
     try:
-        engine = GemmaEngine(model_path=model_path, device=device)
+        engine = GemmaEngine(
+            model_path=model_path,
+            device=device,
+            planner_backend=planner_backend,
+            planner_model_id=planner_model_id,
+            openai_base_url=openai_base_url,
+            openai_api_key=openai_api_key,
+            ollama_host=ollama_host or "http://127.0.0.1:11434",
+        )
     except Exception as e:
         logger.critical(f"❌ Failed to load GemmaEngine: {e}")
         sys.exit(1)
@@ -235,6 +248,14 @@ if __name__ == "__main__":
     parser.add_argument('--no-audio', action='store_true', help='Disable audio input')
     parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
                         help='Set the logging level')
+    # Planner backend options
+    parser.add_argument('--planner-backend', default='gemma', choices=['gemma', 'gptoss_ollama', 'openai'],
+                        help='Backend to use for action planning')
+    parser.add_argument('--planner-model-id', default=None,
+                        help='Model ID for planner backend (e.g., openai/gpt-oss-20b or gpt-4o-mini)')
+    parser.add_argument('--openai-base-url', default=None, help='OpenAI-compatible base URL (for vLLM or OpenAI)')
+    parser.add_argument('--openai-api-key', default=None, help='API key for OpenAI-compatible servers')
+    parser.add_argument('--ollama-host', default=None, help='Ollama host URL (default http://127.0.0.1:11434)')
     
     args = parser.parse_args()
     
@@ -243,4 +264,12 @@ if __name__ == "__main__":
                         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     
     # Run with parsed arguments
-    run(test_mode=args.test, enable_audio=not args.no_audio)
+    run(
+        test_mode=args.test,
+        enable_audio=not args.no_audio,
+        planner_backend=args.planner_backend,
+        planner_model_id=args.planner_model_id,
+        openai_base_url=args.openai_base_url,
+        openai_api_key=args.openai_api_key,
+        ollama_host=args.ollama_host,
+    )
